@@ -1279,10 +1279,10 @@ class PstFrom(object):
                     self.logger.log("Adding obs to control file " "and rewriting pst")
                     self.build_pst(filename=self.pst.filename, update="obs")
                 else:
-                    self.build_pst(filename=self.pst.filename, update=False)
-                    self.logger.warn(
-                        "pst object not available, " "new control file will be written"
+                    self.logger.warning(
+                        "pst object not available, new control file will be written"
                     )
+                    self.build_pst(update=False)
             return new_obs
 
         # list style obs
