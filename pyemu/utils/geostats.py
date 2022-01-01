@@ -1,15 +1,20 @@
 """Geostatistics in the PEST(++) realm
 """
 from __future__ import print_function
-import os
+
 import copy
-from datetime import datetime
+import logging
 import multiprocessing as mp
+import os
 import warnings
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
+import pyemu
 from pyemu.mat.mat_handler import Cov
 from pyemu.utils.pp_utils import pp_file_to_dataframe
+
 from ..pyemu_warnings import PyemuWarning
 
 EPSILON = 1.0e-7
@@ -485,6 +490,7 @@ class SpecSim2d(object):
     def grid_par_ensemble_helper(
         self, pst, gr_df, num_reals, sigma_range=6, logger=None
     ):
+        # type: (pyemu.Pst, pd.DataFrame, int, float, logging.Logger) -> pd.DataFrame
         """wrapper around `SpecSim2d.draw()` designed to support `PstFromFlopy`
         and `PstFrom` grid-based parameters
 
@@ -507,21 +513,22 @@ class SpecSim2d(object):
             `self.initialize()` to deal with the geostruct changes.
 
         """
-
+        if not logger:
+            logger = pyemu.logger.get_logger("grid_par_ensemble_helper", echo=True)
         if "i" not in gr_df.columns:
-            print(gr_df.columns)
-            raise Exception(
-                "SpecSim2d.grid_par_ensmeble_helper() error: 'i' not in gr_df"
-            )
+            msg = "SpecSim2d.grid_par_ensmeble_helper() error: 'i' not in gr_df"
+            logger.error(msg)
+            logger.debug(gr_df.columns)
+            raise ValueError(msg)
         if "j" not in gr_df.columns:
-            print(gr_df.columns)
-            raise Exception(
-                "SpecSim2d.grid_par_ensmeble_helper() error: 'j' not in gr_df"
-            )
+            msg = "SpecSim2d.grid_par_ensmeble_helper() error: 'j' not in gr_df"
+            logger.error(msg)
+            logger.debug(gr_df.columns)
+            raise ValueError(msg)
         if len(self.geostruct.variograms) > 1:
-            raise Exception(
-                "SpecSim2D grid_par_ensemble_helper() error: only a single variogram can be used..."
-            )
+            msg = "SpecSim2D grid_par_ensemble_helper() error: only a single variogram can be used..."
+            logger.error(msg)
+            raise ValueError(msg)
         gr_df.loc[:, "i"] = gr_df.i.apply(np.int64)
         gr_df.loc[:, "j"] = gr_df.j.apply(np.int64)
 
@@ -531,7 +538,7 @@ class SpecSim2d(object):
         new_var = org_var
         new_nug = org_nug
         if self.geostruct.sill != 1.0:
-            print(
+            logger.warning(
                 "SpecSim2d.grid_par_ensemble_helper() warning: scaling contribution and nugget to unity"
             )
             tot = org_var + org_nug
@@ -567,24 +574,22 @@ class SpecSim2d(object):
             self.geostruct.nugget = var * new_nug
             # print(gr_grp, var,new_var,mx_ubnd,mn_lbnd)
             # reinitialize and draw
-            if logger is not None:
-                logger.log(
-                    "SpecSim: drawing {0} realization for group {1} with {4} pars, (log) variance {2} (sill {3})".format(
-                        num_reals, gr_grp, var, self.geostruct.sill, gp_df.shape[0]
-                    )
+            logger.info(
+                "SpecSim: drawing {0} realization for group {1} with {4} pars, (log) variance {2} (sill {3})".format(
+                    num_reals, gr_grp, var, self.geostruct.sill, gp_df.shape[0]
                 )
+            )
             self.initialize()
             reals = self.draw_arrays(num_reals=num_reals, mean_value=mean_arr)
             # put the pieces into the par en
             reals = reals[:, gp_df.i, gp_df.j].reshape(num_reals, gp_df.shape[0])
             real_arrs.append(reals)
             names.extend(list(gp_df.parnme.values))
-            if logger is not None:
-                logger.log(
-                    "SpecSim: drawing {0} realization for group {1} with {4} pars, (log) variance {2} (sill {3})".format(
-                        num_reals, gr_grp, var, self.geostruct.sill, gp_df.shape[0]
-                    )
+            logger.info(
+                "SpecSim: drawing {0} realization for group {1} with {4} pars, (log) variance {2} (sill {3})".format(
+                    num_reals, gr_grp, var, self.geostruct.sill, gp_df.shape[0]
                 )
+            )
 
         # get into a dataframe
         reals = real_arrs[0]
@@ -985,9 +990,9 @@ class OrdinaryKrige(object):
                 # cutting list of cell positions to just in zone
                 xzone = x[zone_array == pt_data_zone].copy()
                 yzone = y[zone_array == pt_data_zone].copy()
-                idx = np.arange(
-                    len(zone_array.ravel())
-                )[(zone_array == pt_data_zone).ravel()]
+                idx = np.arange(len(zone_array.ravel()))[
+                    (zone_array == pt_data_zone).ravel()
+                ]
                 # xzone[zone_array != pt_data_zone] = np.NaN
                 # yzone[zone_array != pt_data_zone] = np.NaN
 
@@ -1008,11 +1013,13 @@ class OrdinaryKrige(object):
                 if var_filename is not None:
                     # rebuild full df so we can build array, as per
                     fulldf = pd.DataFrame(data={"x": x.ravel(), "y": y.ravel()})
-                    fulldf[['idist', 'inames', 'ifacts', 'err_var']] = np.array(
-                        [[[], [], [], np.nan]] * len(fulldf),
-                        dtype=object)
-                    fulldf = fulldf.set_index(['x', 'y'])
-                    fulldf.loc[df.set_index(['x', 'y']).index] = df.set_index(['x', 'y'])
+                    fulldf[["idist", "inames", "ifacts", "err_var"]] = np.array(
+                        [[[], [], [], np.nan]] * len(fulldf), dtype=object
+                    )
+                    fulldf = fulldf.set_index(["x", "y"])
+                    fulldf.loc[df.set_index(["x", "y"]).index] = df.set_index(
+                        ["x", "y"]
+                    )
                     fulldf = fulldf.reset_index()
                     a = fulldf.err_var.values.reshape(x.shape)
                     na_idx = np.isfinite(a.astype(float))
@@ -1255,15 +1262,14 @@ class OrdinaryKrige(object):
                 print("processing interp point:{0} of {1}".format(idx, df.shape[0]))
             if verbose == 2:
                 start = datetime.now()
-                print("calc ipoint dist...", end='')
+                print("calc ipoint dist...", end="")
 
             #  calc dist from this interp point to all point data...slow
             # dist = pd.Series((ptx_array-ix)**2 + (pty_array-iy)**2,ptnames)
             # dist.sort_values(inplace=True)
             # dist = dist.loc[dist <= sqradius]
             # def _dist_calcs(self, ix, iy, ptx_array, pty_array, ptnames, sqradius):
-            dist = self._dist_calcs(ix, iy, ptx_array, pty_array, ptnames,
-                                    sqradius)
+            dist = self._dist_calcs(ix, iy, ptx_array, pty_array, ptnames, sqradius)
 
             # if too few points were found, skip
             if len(dist) < minpts_interp:
@@ -1437,7 +1443,9 @@ class OrdinaryKrige(object):
 
             df[["idist", "inames", "ifacts"]] = pd.DataFrame(
                 [[s[0], n[0], f[0]] for s, n, f in zip(idist, inames, ifacts)],
-                columns=["idist", "inames", "ifacts"], index=df.index)
+                columns=["idist", "inames", "ifacts"],
+                index=df.index,
+            )
 
             df["err_var"] = [
                 float(e[0]) if not isinstance(e[0], list) else float(e[0][0])

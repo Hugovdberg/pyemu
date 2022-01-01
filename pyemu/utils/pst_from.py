@@ -1,24 +1,88 @@
-from __future__ import print_function, division
+import copy
 import os
-from pathlib import Path
-from datetime import datetime
-import shutil
-import inspect
-import warnings
 import platform
+import shutil
+import string
+import time
+import warnings
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, Generic, Tuple, TypeVar
+
 import numpy as np
 import pandas as pd
 import pyemu
-import time
-from ..pyemu_warnings import PyemuWarning
-import copy
-import string
+from pyemu.logger import SuperLogger, get_logger
 
+from ..pyemu_warnings import PyemuWarning
 
 # the tolerable percent difference (100 * (max - min)/mean)
 # used when checking that constant and zone type parameters are in fact constant (within
 # a given zone)
 DIRECT_PAR_PERCENT_DIFF_TOL = 1.0
+
+T = TypeVar("T")
+
+
+class SpatialReference(Generic[T]):
+    def __init__(
+        self,
+        spatial_reference: T,
+        parent_logger: SuperLogger,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        self._spatial_reference = spatial_reference
+        self.logger = parent_logger.getChild(self.__class__.__name__)
+        self.ijwarned: Dict[int, bool] = defaultdict(bool)
+        self.add_pars_callcount: int = 0
+
+    def get_xy(self, args: Tuple[float,...], **kwargs: Any) -> Tuple[float, float]:
+        return self._parse_kij_args(args, kwargs)
+
+    def _parse_kij_args(self, args: Tuple[float,...], kwargs: Dict[str, Any]) -> Tuple[float, float]:
+        """parse args into kij indices.  Called programmatically"""
+        if len(args) >= 2:
+            ij_id = None
+            if "ij_id" in kwargs:
+                ij_id = kwargs["ij_id"]
+            if ij_id is not None:
+                i, j = [args[ij] for ij in ij_id]
+            else:
+                if not self.ijwarned[self.add_pars_callcount]:
+                    self.logger.logged_warning(
+                        "get_xy() warning: position of i and j in index_cols "
+                        "not specified, assume (i,j) are final two entries in "
+                        "index_cols."
+                    )
+                    self.ijwarned[self.add_pars_callcount] = True
+                # assume i and j are the final two entries in index_cols
+                i, j = args[-2], args[-1]
+        else:
+            if not self.ijwarned[self.add_pars_callcount]:
+                self.logger.logged_warning(
+                    (
+                        "get_xy() warning: need locational information "
+                        "(e.g. i,j) to generate xy, "
+                        "insufficient index cols passed to interpret: {}"
+                        ""
+                    ).format(str(args))
+                )
+                self.ijwarned[self.add_pars_callcount] = True
+            i, j = None, None
+        return i, j
+
+
+class GenericSpatialReference(AbstractSpatialReference):
+    def __init__(
+        self,
+        spatial_reference: T,
+        parent_logger: SuperLogger,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(spatial_reference, parent_logger, *args, **kwargs)
 
 
 def _get_datetime_from_str(sdt):
@@ -92,7 +156,6 @@ class PstFrom(object):
         start_datetime=None,
         tpl_subfolder=None,
         chunk_len=50,
-        echo=True,
     ):
 
         self.original_d = Path(original_d)
@@ -139,9 +202,9 @@ class PstFrom(object):
         self.ins_filenames, self.output_filenames = [], []
 
         self.longnames = bool(longnames)
-        self.logger = pyemu.Logger("PstFrom.log", echo=echo)
+        self.logger = get_logger("PstFrom")
 
-        self.logger.statement("starting PstFrom process")
+        self.logger.info("starting PstFrom process")
 
         self._prefix_count = {}
 
@@ -171,12 +234,12 @@ class PstFrom(object):
         # quick checker
         for name, g in pr.groupby("model_file"):
             if g.sep.nunique() > 1:
-                self.logger.warn(
+                self.logger.logged_warning(
                     "separator mismatch for {0}, seps passed {1}"
                     "".format(name, [s for s in g.sep.unique()])
                 )
             if g.fmt.nunique() > 1:
-                self.logger.warn(
+                self.logger.logged_warning(
                     "format mismatch for {0}, fmt passed {1}"
                     "".format(name, [f for f in g.fmt.unique()])
                 )
@@ -232,16 +295,16 @@ class PstFrom(object):
         if isinstance(arg, list):
             arg = tuple(arg)
         xy = self._spatial_reference.get(arg, None)
+        base_error_msg = (
+            f"Pstfrom._dict_get_xy() error getting xy from arg:'{arg}' - {{err}}"
+        )
         if xy is None:
             arg_len = None
             try:
                 arg_len = len(arg)
             except Exception as e:
-                self.logger.lraise(
-                    "Pstfrom._dict_get_xy() error getting xy from arg:'{0}' - no len support".format(
-                        arg
-                    )
-                )
+                msg = base_error_msg.format(err="no len support")
+                raise self.logger.logged_exception(msg, ValueError) from e
             if arg_len == 1:
                 xy = self._spatial_reference.get(arg[0], None)
             elif arg_len == 2 and arg[0] == 0:
@@ -249,14 +312,12 @@ class PstFrom(object):
             elif arg_len == 2 and arg[1] == 0:
                 xy = self._spatial_reference.get(arg[0], None)
             else:
-                self.logger.lraise(
-                    "Pstfrom._dict_get_xy() error getting xy from arg:'{0}'".format(arg)
+                raise self.logger.logged_exception(
+                    base_error_msg.format(err="no value found"), ValueError
                 )
         if xy is None:
-            self.logger.lraise(
-                "Pstfrom._dict_get_xy() error getting xy from arg:'{0}' - still None".format(
-                    arg
-                )
+            raise self.logger.logged_exception(
+                base_error_msg.format(err="still None..."), ValueError
             )
         return xy[0], xy[1]
 
@@ -291,19 +352,17 @@ class PstFrom(object):
                 i, j = [args[ij] for ij in ij_id]
             else:
                 if not self.ijwarned[self.add_pars_callcount]:
-                    self.logger.warn(
-                        (
-                            "get_xy() warning: position of i and j in index_cols "
-                            "not specified, assume (i,j) are final two entries in "
-                            "index_cols."
-                        )
+                    self.logger.logged_warning(
+                        "get_xy() warning: position of i and j in index_cols "
+                        "not specified, assume (i,j) are final two entries in "
+                        "index_cols."
                     )
                     self.ijwarned[self.add_pars_callcount] = True
                 # assume i and j are the final two entries in index_cols
                 i, j = args[-2], args[-1]
         else:
             if not self.ijwarned[self.add_pars_callcount]:
-                self.logger.warn(
+                self.logger.logged_warning(
                     (
                         "get_xy() warning: need locational information "
                         "(e.g. i,j) to generate xy, "
@@ -331,11 +390,12 @@ class PstFrom(object):
             self._spatial_reference.ycentergrid = self._spatial_reference.ycellcenters
             self.get_xy = self._flopy_mg_get_xy
         elif isinstance(self._spatial_reference, dict):
-            self.logger.statement("dictionary-based spatial reference detected...")
+            self.logger.info("dictionary-based spatial reference detected...")
             self.get_xy = self._dict_get_xy
         else:
-            self.logger.lraise(
-                "initialize_spatial_reference() error: " "unsupported spatial_reference"
+            raise self.logger.logged_exception(
+                "initialize_spatial_reference() error: unsupported spatial_reference",
+                TypeError,
             )
         self.spatial_reference = self._spatial_reference
 
@@ -354,13 +414,13 @@ class PstFrom(object):
             for cmd in ilist:
                 new_sys_cmd = "pyemu.os_utils.run(r'{0}')\n".format(cmd)
                 if new_sys_cmd in alist:
-                    self.logger.warn(
+                    self.logger.logged_warning(
                         "sys_cmd '{0}' already in sys cmds, skipping...".format(
                             new_sys_cmd
                         )
                     )
                 else:
-                    self.logger.statement("forward_run line:{0}".format(new_sys_cmd))
+                    self.logger.info("forward_run line:{0}".format(new_sys_cmd))
                     alist.append(new_sys_cmd)
 
         with open(self.new_d / self.py_run_file, "w") as f:
@@ -438,29 +498,28 @@ class PstFrom(object):
 
         """
         struct_dict = self._pivot_par_struct_dict()
-        self.logger.log("building prior covariance matrix")
-        if len(struct_dict) > 0:
-            cov = pyemu.helpers.geostatistical_prior_builder(
-                self.pst, struct_dict=struct_dict, sigma_range=sigma_range
-            )
-        else:
-            cov = pyemu.Cov.from_parameter_data(self.pst, sigma_range=sigma_range)
+        with self.logger.timed_info("building prior covariance matrix"):
+            if len(struct_dict) > 0:
+                cov = pyemu.helpers.geostatistical_prior_builder(
+                    self.pst, struct_dict=struct_dict, sigma_range=sigma_range
+                )
+            else:
+                cov = pyemu.Cov.from_parameter_data(self.pst, sigma_range=sigma_range)
 
-        if filename is None:
-            filename = self.pst.filename.with_suffix(".prior.cov")
-        if fmt != "none":
-            self.logger.statement(
-                "saving prior covariance matrix to file {0}".format(filename)
-            )
-        if fmt == "ascii":
-            cov.to_ascii(filename)
-        elif fmt == "binary":
-            cov.to_binary(filename, droptol=droptol, chunk=chunk)
-        elif fmt == "uncfile":
-            cov.to_uncfile(filename)
-        elif fmt == "coo":
-            cov.to_coo(filename, droptol=droptol, chunk=chunk)
-        self.logger.log("building prior covariance matrix")
+            if filename is None:
+                filename = self.pst.filename.with_suffix(".prior.cov")
+            if fmt != "none":
+                self.logger.info(
+                    "saving prior covariance matrix to file {0}".format(filename)
+                )
+            if fmt == "ascii":
+                cov.to_ascii(filename)
+            elif fmt == "binary":
+                cov.to_binary(filename, droptol=droptol, chunk=chunk)
+            elif fmt == "uncfile":
+                cov.to_uncfile(filename)
+            elif fmt == "coo":
+                cov.to_coo(filename, droptol=droptol, chunk=chunk)
         return cov
 
     def draw(self, num_reals=100, sigma_range=6, use_specsim=False, scale_offset=True):
@@ -486,9 +545,9 @@ class PstFrom(object):
             If you are using grid-style parameters, please use spectral simulation (`use_specsim=True`)
 
         """
-        self.logger.log("drawing realizations")
+        draw_timer = self.logger.timed_info("drawing realizations")
         if self.pst.npar_adj == 0:
-            self.logger.warn("no adjustable parameters, nothing to draw...")
+            self.logger.logged_warning("no adjustable parameters, nothing to draw...")
             return
         # precondition {geostruct:{group:df}} dict to {geostruct:[par_dfs]}
         struct_dict = self._pivot_par_struct_dict()
@@ -498,68 +557,68 @@ class PstFrom(object):
             if not pyemu.geostats.SpecSim2d.grid_is_regular(
                 self.spatial_reference.delr, self.spatial_reference.delc
             ):
-                self.logger.lraise(
-                    "draw() error: can't use spectral simulation with irregular grid"
+                raise self.logger.logged_exception(
+                    "draw() error: can't use spectral simulation with irregular grid",
+                    ValueError,
                 )
-            self.logger.log("spectral simulation for grid-scale pars")
-            # loop over geostructures defined in PestFrom object
-            # (setup through add_parameters)
-            for geostruct, par_df_l in struct_dict.items():
-                par_df = pd.concat(par_df_l)  # force to single df
-                par_df = par_df.loc[par_df.partype == "grid", :]
-                if "i" in par_df.columns:  # need 'i' and 'j' for specsim
-                    grd_p = pd.notna(par_df.i)
-                else:
-                    grd_p = np.array([0])
-                # if there are grid pars (also grid pars with i,j info)
-                if grd_p.sum() > 0:
-                    # select pars to use specsim for
-                    gr_df = par_df.loc[grd_p]
-                    gr_df = gr_df.astype({"i": int, "j": int})  # make sure int
-                    # (won't be if there were nans in concatenated df)
-                    if len(gr_df) > 0:
-                        # get specsim object for this geostruct
-                        ss = pyemu.geostats.SpecSim2d(
-                            delx=self.spatial_reference.delr,
-                            dely=self.spatial_reference.delc,
-                            geostruct=geostruct,
-                        )
-                        # specsim draw (returns df)
-                        gr_pe1 = ss.grid_par_ensemble_helper(
-                            pst=self.pst,
-                            gr_df=gr_df,
-                            num_reals=num_reals,
-                            sigma_range=sigma_range,
-                            logger=self.logger,
-                        )
-                        # append to list of specsim drawn pars
-                        gr_pe_l.append(gr_pe1)
-                        # rebuild struct_dict entry for this geostruct
-                        # to not include specsim pars
-                        struct_dict[geostruct] = []
-                        # loop over all in list associated with geostruct
-                        for p_df in par_df_l:
-                            # if pars are not in the specsim pars just created
-                            # assign them to this struct_dict entry
-                            # needed if none specsim pars are linked to same geostruct
-                            if not p_df.index.isin(gr_df.index).all():
-                                struct_dict[geostruct].append(p_df)
-            self.logger.log("spectral simulation for grid-scale pars")
+            with self.logger.timed_info("spectral simulation for grid-scale pars"):
+                # loop over geostructures defined in PestFrom object
+                # (setup through add_parameters)
+                for geostruct, par_df_l in struct_dict.items():
+                    par_df = pd.concat(par_df_l)  # force to single df
+                    par_df = par_df.loc[par_df.partype == "grid", :]
+                    if "i" in par_df.columns:  # need 'i' and 'j' for specsim
+                        grd_p = pd.notna(par_df.i)
+                    else:
+                        grd_p = np.array([0])
+                    # if there are grid pars (also grid pars with i,j info)
+                    if grd_p.sum() > 0:
+                        # select pars to use specsim for
+                        gr_df = par_df.loc[grd_p]
+                        gr_df = gr_df.astype({"i": int, "j": int})  # make sure int
+                        # (won't be if there were nans in concatenated df)
+                        if len(gr_df) > 0:
+                            # get specsim object for this geostruct
+                            ss = pyemu.geostats.SpecSim2d(
+                                delx=self.spatial_reference.delr,
+                                dely=self.spatial_reference.delc,
+                                geostruct=geostruct,
+                            )
+                            # specsim draw (returns df)
+                            gr_pe1 = ss.grid_par_ensemble_helper(
+                                pst=self.pst,
+                                gr_df=gr_df,
+                                num_reals=num_reals,
+                                sigma_range=sigma_range,
+                                logger=self.logger,
+                            )
+                            # append to list of specsim drawn pars
+                            gr_pe_l.append(gr_pe1)
+                            # rebuild struct_dict entry for this geostruct
+                            # to not include specsim pars
+                            struct_dict[geostruct] = []
+                            # loop over all in list associated with geostruct
+                            for p_df in par_df_l:
+                                # if pars are not in the specsim pars just created
+                                # assign them to this struct_dict entry
+                                # needed if none specsim pars are linked to same geostruct
+                                if not p_df.index.isin(gr_df.index).all():
+                                    struct_dict[geostruct].append(p_df)
+
         # draw remaining pars based on their geostruct
-        self.logger.log("Drawing non-specsim pars")
-        pe = pyemu.helpers.geostatistical_draws(
-            self.pst,
-            struct_dict=struct_dict,
-            num_reals=num_reals,
-            sigma_range=sigma_range,
-            scale_offset=scale_offset,
-        )
-        self.logger.log("Drawing non-specsim pars")
+        with self.logger.timed_info("Drawing non-specsim pars"):
+            pe = pyemu.helpers.geostatistical_draws(
+                self.pst,
+                struct_dict=struct_dict,
+                num_reals=num_reals,
+                sigma_range=sigma_range,
+                scale_offset=scale_offset,
+            )
         if len(gr_pe_l) > 0:
             gr_par_pe = pd.concat(gr_pe_l, axis=1)
             pe.loc[:, gr_par_pe.columns] = gr_par_pe.values
         # par_ens = pyemu.ParameterEnsemble(pst=self.pst, df=pe)
-        self.logger.log("drawing realizations")
+        draw_timer.finish()
         return pe
 
     def build_pst(self, filename=None, update=False, version=1):
@@ -590,7 +649,7 @@ class PstFrom(object):
         obs_data_cols = pyemu.pst_utils.pst_config["obs_fieldnames"]
         if update:
             if self.pst is None:
-                self.logger.warn(
+                self.logger.logged_warning(
                     "Can't update Pst object not initialised. "
                     "Setting update to False"
                 )
@@ -679,43 +738,48 @@ class PstFrom(object):
         return pst
 
     def _setup_dirs(self):
-        self.logger.log("setting up dirs")
-        if not os.path.exists(self.original_d):
-            self.logger.lraise(f"original_d '{self.original_d}' not found")
-        if not os.path.isdir(self.original_d):
-            self.logger.lraise(f"original_d '{self.original_d}' is not a directory")
-        if self.new_d.exists():
-            if self.remove_existing:
-                self.logger.log(f"removing existing new_d '{self.new_d}'")
-                shutil.rmtree(self.new_d)
-                self.logger.log(f"removing existing new_d '{self.new_d}'")
-                time.sleep(1)  # sleep longer for window locking issues
-            else:
-                self.logger.lraise(
-                    f"new_d '{self.new_d}' already exists " "- use remove_existing=True"
+        with self.logger.timed_info("setting up dirs"):
+            if not os.path.exists(self.original_d):
+                raise self.logger.logged_exception(
+                    f"original_d '{self.original_d}' not found", ValueError
                 )
+            if not os.path.isdir(self.original_d):
+                raise self.logger.logged_exception(
+                    f"original_d '{self.original_d}' is not a directory", ValueError
+                )
+            if self.new_d.exists():
+                if self.remove_existing:
+                    with self.logger.timed_info(
+                        f"removing existing new_d '{self.new_d}'"
+                    ):
+                        shutil.rmtree(self.new_d)
+                        time.sleep(1)  # sleep longer for window locking issues
+                else:
+                    raise self.logger.logged_exception(
+                        f"new_d '{self.new_d}' already exists - use remove_existing=True",
+                        ValueError,
+                    )
 
-        self.logger.log(
-            f"copying original_d '{self.original_d}' to new_d '{self.new_d}'"
-        )
-        shutil.copytree(self.original_d, self.new_d)
-        self.logger.log(
-            f"copying original_d '{self.original_d}' to new_d '{self.new_d}'"
-        )
+            with self.logger.timed_info(
+                f"copying original_d '{self.original_d}' to new_d '{self.new_d}'",
+            ):
+                shutil.copytree(self.original_d, self.new_d)
 
-        self.original_file_d = self.new_d / "org"
-        if self.original_file_d.exists():
-            self.logger.lraise(f"'org' subdir already exists in new_d '{self.new_d}'")
-        self.original_file_d.mkdir(exist_ok=True)
+            self.original_file_d = self.new_d / "org"
+            if self.original_file_d.exists():
+                raise self.logger.logged_exception(
+                    f"'org' subdir already exists in new_d '{self.new_d}'", ValueError
+                )
+            self.original_file_d.mkdir(exist_ok=True)
 
-        self.mult_file_d = self.new_d / "mult"
-        if self.mult_file_d.exists():
-            self.logger.lraise(f"'mult' subdir already exists in new_d '{self.new_d}'")
-        self.mult_file_d.mkdir(exist_ok=True)
+            self.mult_file_d = self.new_d / "mult"
+            if self.mult_file_d.exists():
+                raise self.logger.logged_exception(
+                    f"'mult' subdir already exists in new_d '{self.new_d}'", ValueError
+                )
+            self.mult_file_d.mkdir(exist_ok=True)
 
-        self.tpl_d.mkdir(exist_ok=True)
-
-        self.logger.log("setting up dirs")
+            self.tpl_d.mkdir(exist_ok=True)
 
     def _par_prep(
         self,
@@ -756,7 +820,9 @@ class PstFrom(object):
                 # data file in dest_ws/org/ folder
                 org_file = self.original_file_d / rel_filepath.name
 
-                self.logger.log(f"loading list-style {dest_filepath}")
+                load_timer = self.logger.timed_info(
+                    f"loading list-style {dest_filepath}"
+                )
                 df, storehead, _ = self._load_listtype_file(
                     rel_filepath, index_cols, use_cols, fmt, sep, skip, c_char
                 )
@@ -779,7 +845,7 @@ class PstFrom(object):
                 else:
                     hheader = df.columns
 
-                self.logger.statement(
+                self.logger.info(
                     f"loaded list-style '{dest_filepath}' of shape {df.shape}"
                 )
                 # TODO BH: do we need to be careful of the format of the model
@@ -805,7 +871,7 @@ class PstFrom(object):
                         fr = 0
                         for key in sorted(storehead.keys()):
                             if key > lc:
-                                self.logger.warn(
+                                self.logger.logged_warning(
                                     "Detected mid-table comment "
                                     f"on line {key + 1} tabular model file, "
                                     "comment will be lost"
@@ -845,19 +911,20 @@ class PstFrom(object):
                 fmt_dict[rel_filepath] = fmt
                 sep_dict[rel_filepath] = sep
                 skip_dict[rel_filepath] = skip
-                self.logger.log(f"loading list-style {dest_filepath}")
+                load_timer.finish()
 
             # check for compatibility
             fnames = list(file_dict.keys())
             for i in range(len(fnames)):
                 for j in range(i + 1, len(fnames)):
                     if file_dict[fnames[i]].shape[1] != file_dict[fnames[j]].shape[1]:
-                        self.logger.lraise(
+                        msg = (
                             f"shape mismatch for array style, '{fnames[i]}' "
                             f"shape {file_dict[fnames[i]].shape[1]} != "
                             f"'{fnames[j]}' "
                             f"shape {file_dict[fnames[j]].shape[1]}"
                         )
+                        raise self.logger.logged_exception(msg, ValueError)
         else:  # load array type files
             # loop over model input files
             for input_filena, sep, fmt, skip in zip(filenames, seps, fmts, skip_rows):
@@ -877,15 +944,14 @@ class PstFrom(object):
                 # file path relative to model workspace
                 rel_filepath = input_filena.relative_to(self.original_d)
                 dest_filepath = self.new_d / rel_filepath
-                self.logger.log(f"loading array {dest_filepath}")
-                if not dest_filepath.exists():
-                    self.logger.lraise(f"par filename '{dest_filepath}' not found ")
-                # read array type input file
-                arr = np.loadtxt(dest_filepath, delimiter=sep, ndmin=2)
-                self.logger.log(f"loading array {dest_filepath}")
-                self.logger.statement(
-                    f"loaded array '{input_filena}' of shape {arr.shape}"
-                )
+                with self.logger.timed_info(f"loading array {dest_filepath}"):
+                    if not dest_filepath.exists():
+                        raise self.logger.logged_exception(
+                            f"par filename '{dest_filepath}' not found ", ValueError
+                        )
+                    # read array type input file
+                    arr = np.loadtxt(dest_filepath, delimiter=sep, ndmin=2)
+                self.logger.info(f"loaded array '{input_filena}' of shape {arr.shape}")
                 # save copy of input file to `org` dir
                 # make any subfolders if they don't exist
                 np.savetxt(self.original_file_d / rel_filepath.name, arr)
@@ -898,12 +964,13 @@ class PstFrom(object):
             for i in range(len(fnames)):
                 for j in range(i + 1, len(fnames)):
                     if file_dict[fnames[i]].shape != file_dict[fnames[j]].shape:
-                        self.logger.lraise(
+                        msg = (
                             f"shape mismatch for array style, '{fnames[i]}' "
                             f"shape {file_dict[fnames[i]].shape[1]} != "
                             f"'{fnames[j]}' "
                             f"shape {file_dict[fnames[j]].shape[1]}"
                         )
+                        raise self.logger.logged_exception(msg, ValueError)
         return (
             index_cols,
             use_cols,
@@ -973,22 +1040,22 @@ class PstFrom(object):
                 "add_py_function(): 'function_name' argument is deprecated, "
                 "use 'call_str' instead",
                 DeprecationWarning,
+                stacklevel=2,
             )
             if call_str is None:
                 call_str = function_name
+        logger = self.logger.getChild("add_py_function()")
         if call_str is None:
-            self.logger.lraise(
-                "add_py_function(): No function call string passed in arg " "'call_str'"
+            raise logger.logged_exception(
+                "No function call string passed in arg " "'call_str'", ValueError
             )
         if not os.path.exists(file_name):
-            self.logger.lraise(
-                "add_py_function(): couldnt find python source file '{0}'".format(
-                    file_name
-                )
+            raise logger.logged_exception(
+                f"couldnt find python source file '{file_name}'", ValueError
             )
         if "(" not in call_str or ")" not in call_str:
-            self.logger.lraise(
-                "add_py_function(): call_str '{0}' missing paretheses".format(call_str)
+            raise logger.logged_exception(
+                f"call_str '{call_str}' missing paretheses", ValueError
             )
         function_name = call_str[
             : call_str.find("(")
@@ -1001,10 +1068,8 @@ class PstFrom(object):
             while True:
                 line = f.readline()
                 if line == "":
-                    self.logger.lraise(
-                        "add_py_function(): EOF while searching for function '{0}'".format(
-                            search_str
-                        )
+                    raise logger.logged_exception(
+                        f"EOF while searching for function '{search_str}'", ValueError
                     )
                 if line.startswith(
                     search_str
@@ -1025,11 +1090,7 @@ class PstFrom(object):
         elif is_pre_cmd is False:
             self.post_py_cmds.append(call_str)
         else:
-            self.logger.warn(
-                "add_py_function() command: {0} is not being called directly".format(
-                    call_str
-                )
-            )
+            logger.logged_warning(f"command: {call_str} is not being called directly")
 
     def _process_array_obs(
         self,
@@ -1064,12 +1125,13 @@ class PstFrom(object):
 
         """
         if ofile_sep is not None:
-            self.logger.lraise(
-                "array obs are currently only supported for whitespace delim"
+            raise self.logger.logged_exception(
+                "array obs are currently only supported for whitespace delim",
+                ValueError,
             )
         if not os.path.exists(self.new_d / out_filename):
-            self.logger.lraise(
-                "array obs output file '{0}' not found".format(out_filename)
+            raise self.logger.logged_exception(
+                f"array obs output file '{out_filename}' not found", ValueError
             )
         if len(prefix) == 0 and self.longnames:
             prefix = Path(out_filename).stem
@@ -1094,10 +1156,9 @@ class PstFrom(object):
                 try:
                     fr = float(r)
                 except Exception as e:
-                    self.logger.lraise(
-                        "array obs error casting: '{0}' on line {1} to a float: {2}".format(
-                            r, iline, str(e)
-                        )
+                    raise self.logger.logged_exception(
+                        f"array obs error casting: '{r}' on line {iline} to a float: {e}",
+                        ValueError,
                     )
 
                 zval = None
@@ -1105,11 +1166,9 @@ class PstFrom(object):
                     try:
                         zval = zone_array[iidx, jr]
                     except Exception as e:
-                        self.logger.lraise(
-                            "array obs error getting zone value for i,j {0},{1} in line {2}: {3}".format(
-                                iidx, jr, iline, str(e)
-                            )
-                        )
+                        raise self.logger.logged_exception(
+                            f"array obs error getting zone value for i,j {iidx},{jr} in line {iline}: {e}"
+                        ) from e
                     if zval <= 0:
                         f_ins.write(" !dum! ")
                         if jr < len(raw) - 1:
@@ -1127,8 +1186,8 @@ class PstFrom(object):
                         if len(oname) + len(z_str) < 20:
                             oname += z_str
                     if len(oname) > 20:
-                        self.logger.lraise(
-                            "array obs name too long: '{0}'".format(oname)
+                        raise self.logger.logged_exception(
+                            f"array obs name too long: '{oname}'", ValueError
                         )
                 f_ins.write(" !{0}! ".format(oname))
                 if jr < len(raw) - 1:
@@ -1219,7 +1278,9 @@ class PstFrom(object):
         use_cols_psd = copy.copy(use_cols)  # store passed use_cols argument
         if insfile is None:  # setup instruction file name
             insfile = "{0}.ins".format(filename)
-        self.logger.log("adding observations from output file " "{0}".format(filename))
+        add_obs_timer = self.logger.timed_info(
+            "adding observations from output file {0}".format(filename),
+        )
         # precondition arguments
         (
             filenames,
@@ -1240,54 +1301,56 @@ class PstFrom(object):
         if index_cols is None and use_cols is None:
             if not isinstance(filenames, str):
                 if len(filenames) > 1:
-                    self.logger.lraise(
-                        "only a single filename can be used for array-style observations"
+                    raise self.logger.logged_exception(
+                        "only a single filename can be used for array-style observations",
+                        ValueError,
                     )
                 filenames = filenames[0]
-            self.logger.log(
-                "adding observations from array output file '{0}'".format(filenames)
-            )
-            # Setup obs for array style output, build and write instruction file
-            self._process_array_obs(
-                filenames,
-                insfile,
-                prefix,
-                ofile_sep,
-                ofile_skip,
-                self.longnames,
-                zone_array,
-            )
+            with self.logger.timed_info(
+                f"adding observations from array output file '{filenames}'",
+            ):
+                # Setup obs for array style output, build and write instruction file
+                self._process_array_obs(
+                    filenames,
+                    insfile,
+                    prefix,
+                    ofile_sep,
+                    ofile_skip,
+                    self.longnames,
+                    zone_array,
+                )
 
-            # Add obs from ins file written by _process_array_obs()
-            new_obs = self.add_observations_from_ins(
-                ins_file=self.new_d / insfile, out_file=self.new_d / filename
-            )
-            # Try to add an observation group name -- should default to `obgnme`
-            # TODO: note list style default to base of obs name, here array default to `obgnme`
-            if obsgp is not None:  # if a group name is passed
-                new_obs.loc[:, "obgnme"] = obsgp
-            elif prefix is not None and len(prefix) != 0:  # if prefix is passed
-                new_obs.loc[:, "obgnme"] = prefix
-            elif self.longnames:
-                new_obs.loc[:, "obgnme"] = "oname:{0}_otype:arr".format(filenames)
-            # else will default to `obgnme`
-            self.logger.log(
-                "adding observations from array output file '{0}'".format(filenames)
-            )
+                # Add obs from ins file written by _process_array_obs()
+                new_obs = self.add_observations_from_ins(
+                    ins_file=self.new_d / insfile, out_file=self.new_d / filename
+                )
+                # Try to add an observation group name -- should default to `obgnme`
+                # TODO: note list style default to base of obs name, here array default to `obgnme`
+                if obsgp is not None:  # if a group name is passed
+                    new_obs.loc[:, "obgnme"] = obsgp
+                elif prefix is not None and len(prefix) != 0:  # if prefix is passed
+                    new_obs.loc[:, "obgnme"] = prefix
+                elif self.longnames:
+                    new_obs.loc[:, "obgnme"] = "oname:{0}_otype:arr".format(filenames)
+                # else will default to `obgnme`
             if rebuild_pst:
                 if self.pst is not None:
-                    self.logger.log("Adding obs to control file " "and rewriting pst")
-                    self.build_pst(filename=self.pst.filename, update="obs")
+                    with self.logger.timed_info(
+                        "Adding obs to control file and rewriting pst"
+                    ):
+                        self.build_pst(filename=self.pst.filename, update="obs")
                 else:
-                    self.logger.warning(
+                    self.logger.logged_warning(
                         "pst object not available, new control file will be written"
                     )
                     self.build_pst(update=False)
+
+            add_obs_timer.finish()
             return new_obs
 
         # list style obs
-        self.logger.log(
-            "adding observations from tabular output file " "'{0}'".format(filenames)
+        add_tab_obs_timer = self.logger.timed_info(
+            f"adding observations from tabular output file '{filenames}'",
         )
         # -- will end up here if either of index_cols or use_cols is not None
         df, storehead, inssep = self._load_listtype_file(
@@ -1326,77 +1389,74 @@ class PstFrom(object):
         for filename, sep in zip(
             filenames, inssep
         ):  # should only ever be one but hey...
-            self.logger.log(
-                "building insfile for tabular output file {0}" "".format(filename)
-            )
-            # Build dataframe from output file df for use in insfile
-            df_temp = _get_tpl_or_ins_df(
-                df,
-                prefix,
-                typ="obs",
-                index_cols=index_cols,
-                use_cols=use_cols,
-                longnames=self.longnames,
-            )
-            df.loc[:, "idx_str"] = df_temp.idx_strs
-            # Select only certain rows if requested
-            if use_rows is not None:
-                if isinstance(use_rows, str):
-                    if use_rows not in df.idx_str:
-                        self.logger.warn(
-                            "can't find {0} in generated observation idx_str. "
-                            "setting up obs for all rows instead"
-                            "".format(use_rows)
-                        )
-                        use_rows = None
-                elif isinstance(use_rows, int):
-                    use_rows = [use_rows]
-                use_rows = [r for r in use_rows if r <= len(df)]
-                use_rows = df.iloc[use_rows].idx_str.unique()
+            with self.logger.timed_info(
+                f"building insfile for tabular output file {filename}"
+            ):
+                # Build dataframe from output file df for use in insfile
+                df_temp = _get_tpl_or_ins_df(
+                    df,
+                    prefix,
+                    typ="obs",
+                    index_cols=index_cols,
+                    use_cols=use_cols,
+                    longnames=self.longnames,
+                )
+                df.loc[:, "idx_str"] = df_temp.idx_strs
+                # Select only certain rows if requested
+                if use_rows is not None:
+                    if isinstance(use_rows, str):
+                        if use_rows not in df.idx_str:
+                            self.logger.logged_warning(
+                                f"can't find {use_rows} in generated observation idx_str. "
+                                "setting up obs for all rows instead"
+                            )
+                            use_rows = None
+                    elif isinstance(use_rows, int):
+                        use_rows = [use_rows]
+                    use_rows = [r for r in use_rows if r <= len(df)]
+                    use_rows = df.iloc[use_rows].idx_str.unique()
 
-            # Construct ins_file from df
-            # first rectify group name with number of columns
-            ncol = len(use_cols)
-            fill = True  # default fill=True means that the groupname will be
-            # derived from the base of the observation name
-            # if passed group name is a string or list with len < ncol
-            # and passed use_cols was None or of len > len(obsgp)
-            if obsgp is not None:
-                if use_cols_psd is None:  # no use_cols defined (all are setup)
-                    if len([obsgp] if isinstance(obsgp, str) else obsgp) == 1:
-                        # only 1 group provided, assume passed obsgp applys
-                        # to all use_cols
-                        fill = "first"
-                    else:
-                        # many obs groups passed, assume last will fill if < ncol
-                        fill = "last"
-                # else fill will be set to True (base of obs name will be used)
-            else:
-                obsgp = True  # will use base of col
-            obsgp = _check_var_len(obsgp, ncol, fill=fill)
-            nprefix = prefix
+                # Construct ins_file from df
+                # first rectify group name with number of columns
+                ncol = len(use_cols)
+                fill = True  # default fill=True means that the groupname will be
+                # derived from the base of the observation name
+                # if passed group name is a string or list with len < ncol
+                # and passed use_cols was None or of len > len(obsgp)
+                if obsgp is not None:
+                    if use_cols_psd is None:  # no use_cols defined (all are setup)
+                        if len([obsgp] if isinstance(obsgp, str) else obsgp) == 1:
+                            # only 1 group provided, assume passed obsgp applys
+                            # to all use_cols
+                            fill = "first"
+                        else:
+                            # many obs groups passed, assume last will fill if < ncol
+                            fill = "last"
+                    # else fill will be set to True (base of obs name will be used)
+                else:
+                    obsgp = True  # will use base of col
+                obsgp = _check_var_len(obsgp, ncol, fill=fill)
+                nprefix = prefix
 
-            if self.longnames:
-                if len(nprefix) == 0:
-                    nprefix = filenames[0]
-                nprefix = "oname:{0}_otype:lst".format(nprefix)
-            df_ins = pyemu.pst_utils.csv_to_ins_file(
-                df.set_index("idx_str"),
-                ins_filename=self.new_d / insfile,
-                only_cols=use_cols,
-                only_rows=use_rows,
-                marker="~",
-                includes_header=includes_header,
-                includes_index=False,
-                prefix=nprefix,
-                longnames=self.longnames,
-                head_lines_len=lenhead,
-                sep=sep,
-                gpname=obsgp,
-            )
-            self.logger.log(
-                "building insfile for tabular output file {0}" "".format(filename)
-            )
+                if self.longnames:
+                    if len(nprefix) == 0:
+                        nprefix = filenames[0]
+                    nprefix = "oname:{0}_otype:lst".format(nprefix)
+                df_ins = pyemu.pst_utils.csv_to_ins_file(
+                    df.set_index("idx_str"),
+                    ins_filename=self.new_d / insfile,
+                    only_cols=use_cols,
+                    only_rows=use_rows,
+                    marker="~",
+                    includes_header=includes_header,
+                    includes_index=False,
+                    prefix=nprefix,
+                    longnames=self.longnames,
+                    head_lines_len=lenhead,
+                    sep=sep,
+                    gpname=obsgp,
+                )
+
             new_obs = self.add_observations_from_ins(
                 ins_file=self.new_d / insfile, out_file=self.new_d / filename
             )
@@ -1404,21 +1464,22 @@ class PstFrom(object):
                 new_obs.loc[:, "obgnme"] = df_ins.loc[new_obs.index, "obgnme"]
             new_obs_l.append(new_obs)
         new_obs = pd.concat(new_obs_l)
-        self.logger.log(
-            "adding observations from tabular output file " "'{0}'".format(filenames)
-        )
+        add_tab_obs_timer.finish()
         if rebuild_pst:
             if self.pst is not None:
-                self.logger.log("Adding obs to control file " "and rewriting pst")
-                self.build_pst(filename=self.pst.filename, update="obs")
+                with self.logger.timed_info(
+                    "Adding obs to control file and rewriting pst"
+                ):
+                    self.build_pst(filename=self.pst.filename, update="obs")
             else:
                 pstname = Path(self.new_d, self.original_d.name)
-                self.logger.warn(
+                self.logger.logged_warning(
                     "pst object not available, "
                     f"new control file will be written with filename {pstname}"
                 )
                 self.build_pst(filename=None, update=False)
 
+        add_obs_timer.finish()
         return new_obs
 
     def add_observations_from_ins(
@@ -1469,78 +1530,79 @@ class PstFrom(object):
         # else:
         # assuming that passed insfile is the full path to file from current location
         if not os.path.exists(ins_file):
-            self.logger.lraise(
-                "ins file not found: {0}, {1}" "".format(os.getcwd(), ins_file)
+            raise self.logger.logged_exception(
+                f"ins file not found: {os.getcwd()}, {ins_file}", ValueError
             )
         if out_file is None:
             out_file = str(ins_file).replace(".ins", "")
         elif os.path.dirname(out_file) in ["", "."]:
             out_file = self.new_d / out_file
         if ins_file == out_file:
-            self.logger.lraise("ins_file == out_file, doh!")
+            raise self.logger.logged_exception("ins_file == out_file, doh!", ValueError)
 
         # get the obs names in the instructions file
-        self.logger.log(
-            "adding observation from instruction file '{0}'".format(ins_file)
-        )
-        obsnme = pyemu.pst_utils.parse_ins_file(ins_file)
+        with self.logger.timed_info(
+            f"adding observation from instruction file '{ins_file}'"
+        ):
+            obsnme = pyemu.pst_utils.parse_ins_file(ins_file)
 
-        sobsnme = set(obsnme)
-        if len(self.obs_dfs) > 0:
-            sexist = pd.concat(self.obs_dfs).obsnme
-        else:
-            sexist = []
-        sexist = set(sexist)  # todo need to check this here?
-        sint = sobsnme.intersection(sexist)
-        if len(sint) > 0:
-            self.logger.lraise(
-                "the following obs instruction file {0} are already in the "
-                "control file:{1}".format(ins_file, ",".join(sint))
+            sobsnme = set(obsnme)
+            if len(self.obs_dfs) > 0:
+                sexist = pd.concat(self.obs_dfs).obsnme
+            else:
+                sexist = []
+            sexist = set(sexist)  # todo need to check this here?
+            sint = sobsnme.intersection(sexist)
+            if len(sint) > 0:
+                raise self.logger.logged_exception(
+                    "the following obs instruction file {0} are already in the "
+                    "control file:{1}".format(ins_file, ",".join(sint)),
+                    ValueError,
+                )
+
+            # find "new" obs that are not already in the control file
+            new_obsnme = sobsnme - sexist
+            if len(new_obsnme) == 0:
+                raise self.logger.logged_exception(
+                    "no new observations found in instruction file {0}".format(
+                        ins_file
+                    ),
+                    ValueError,
+                )
+
+            # extend observation_data
+            new_obsnme = np.sort(list(new_obsnme))
+            new_obs_data = pyemu.pst_utils._populate_dataframe(
+                new_obsnme,
+                pyemu.pst_utils.pst_config["obs_fieldnames"],
+                pyemu.pst_utils.pst_config["obs_defaults"],
+                pyemu.pst_utils.pst_config["obs_dtype"],
             )
+            new_obs_data.loc[new_obsnme, "obsnme"] = new_obsnme
+            new_obs_data.index = new_obsnme
 
-        # find "new" obs that are not already in the control file
-        new_obsnme = sobsnme - sexist
-        if len(new_obsnme) == 0:
-            self.logger.lraise(
-                "no new observations found in instruction file {0}".format(ins_file)
-            )
-
-        # extend observation_data
-        new_obsnme = np.sort(list(new_obsnme))
-        new_obs_data = pyemu.pst_utils._populate_dataframe(
-            new_obsnme,
-            pyemu.pst_utils.pst_config["obs_fieldnames"],
-            pyemu.pst_utils.pst_config["obs_defaults"],
-            pyemu.pst_utils.pst_config["obs_dtype"],
-        )
-        new_obs_data.loc[new_obsnme, "obsnme"] = new_obsnme
-        new_obs_data.index = new_obsnme
-
-        # need path relative to where control file
-        ins_file_pstrel = Path(ins_file).relative_to(self.new_d)
-        out_file_pstrel = Path(out_file).relative_to(self.new_d)
-        if pst_path is not None:
-            ins_file_pstrel = pst_path / ins_file_pstrel
-            out_file_pstrel = pst_path / out_file_pstrel
-        self.ins_filenames.append(ins_file_pstrel)
-        self.output_filenames.append(out_file_pstrel)
-        # add to temporary files to be removed at start of forward run
-        self.tmp_files.append(out_file_pstrel)
-        df = None
-        if inschek:
-            # df = pst_utils._try_run_inschek(ins_file,out_file,cwd=cwd)
-            # ins_file = os.path.join(cwd, ins_file)
-            # out_file = os.path.join(cwd, out_file)
-            df = pyemu.pst_utils.try_process_output_file(
-                ins_file=ins_file, output_file=out_file
-            )
-        if df is not None:
-            # print(self.observation_data.index,df.index)
-            new_obs_data.loc[df.index, "obsval"] = df.obsval
-        self.obs_dfs.append(new_obs_data)
-        self.logger.log(
-            "adding observation from instruction file '{0}'".format(ins_file)
-        )
+            # need path relative to where control file
+            ins_file_pstrel = Path(ins_file).relative_to(self.new_d)
+            out_file_pstrel = Path(out_file).relative_to(self.new_d)
+            if pst_path is not None:
+                ins_file_pstrel = pst_path / ins_file_pstrel
+                out_file_pstrel = pst_path / out_file_pstrel
+            self.ins_filenames.append(ins_file_pstrel)
+            self.output_filenames.append(out_file_pstrel)
+            # add to temporary files to be removed at start of forward run
+            self.tmp_files.append(out_file_pstrel)
+            df = None
+            if inschek:
+                # df = pst_utils._try_run_inschek(ins_file,out_file,cwd=cwd)
+                # ins_file = os.path.join(cwd, ins_file)
+                # out_file = os.path.join(cwd, out_file)
+                df = pyemu.pst_utils.try_process_output_file(
+                    ins_file=ins_file, output_file=out_file
+                )
+            if df is not None:
+                # print(self.observation_data.index,df.index)
+                new_obs_data.loc[df.index, "obsval"] = df.obsval
+            self.obs_dfs.append(new_obs_data)
         return new_obs_data
 
     def add_parameters(
@@ -1703,15 +1765,17 @@ class PstFrom(object):
         self.add_pars_callcount += 1
         self.ijwarned[self.add_pars_callcount] = False
 
+        logger = self.logger.getChild("add_parameters")
         if transform.lower().strip() not in ["none", "log", "fixed"]:
-            self.logger.lraise(
+            raise logger.logged_exception(
                 "unrecognized transform ('{0}'), should be in ['none','log','fixed']".format(
                     transform
-                )
+                ),
+                ValueError,
             )
         if transform == "fixed" and geostruct is not None:
-            self.logger.lraise(
-                "geostruct is not 'None', cant draw values for fixed pars"
+            raise logger.logged_exception(
+                "geostruct is not 'None', cant draw values for fixed pars", ValueError
             )
 
         # some checks for direct parameters
@@ -1719,10 +1783,11 @@ class PstFrom(object):
         if len(par_style) > 1:
             par_style = par_style[0]
         if par_style not in ["m", "d", "a"]:
-            self.logger.lraise(
-                "add_parameters(): unrecognized 'style': {0}, should be either 'm'/'mult'/'multiplier', 'a'/'add'/'addend' or 'd'/'direct'".format(
+            raise logger.logged_exception(
+                "unrecognized 'style': {0}, should be either 'm'/'mult'/'multiplier', 'a'/'add'/'addend' or 'd'/'direct'".format(
                     par_style
-                )
+                ),
+                ValueError,
             )
 
         if initial_value is None:
@@ -1749,47 +1814,49 @@ class PstFrom(object):
             get_relative_filepath(self.original_d, filename) for filename in filenames
         ]
         if len(filenames) == 0:
-            self.logger.lraise("add_parameters(): filenames is empty")
+            raise logger.logged_exception("filenames is empty", ValueError)
         if par_style == "d":
             if len(filenames) != 1:
-                self.logger.lraise(
-                    "add_parameters(): 'filenames' arg for 'direct' style "
+                raise logger.logged_exception(
+                    "'filenames' arg for 'direct' style "
                     "must contain one and only one filename, "
-                    f"not {len(filenames)} files"
+                    f"not {len(filenames)} files",
+                    ValueError,
                 )
             if filenames[0] in self.direct_org_files:
-                self.logger.lraise(
-                    f"add_parameters(): original model input file "
-                    f"'{filenames[0]}' already used for 'direct' parameterization"
+                raise logger.logged_exception(
+                    f"original model input file "
+                    f"'{filenames[0]}' already used for 'direct' parameterization",
+                    ValueError,
                 )
             else:
                 self.direct_org_files.append(filenames[0])
         # Default par data columns used for pst
         par_data_cols = pyemu.pst_utils.pst_config["par_fieldnames"]
-        self.logger.log(
+        add_par_timer = logger.timed_info(
             f"adding {par_type} type {par_style} style parameters for file(s) "
             f"{[str(f) for f in filenames]}"
         )
         if geostruct is not None:
             if geostruct.sill != 1.0:  #  and par_style != "multiplier": #TODO !=?
-                self.logger.warn(
+                logger.logged_warning(
                     "geostruct sill != 1.0"  # for 'multiplier' style parameters"
                 )
             if geostruct.transform != transform:
-                self.logger.warn(
-                    "0) Inconsistency between " "geostruct transform and partrans."
+                logger.logged_warning(
+                    "0) Inconsistency between geostruct transform and partrans."
                 )
-                self.logger.warn(f"1) Setting geostruct transform to " "{transform}")
+                logger.logged_warning(f"1) Setting geostruct transform to {transform}")
                 if geostruct not in self.par_struct_dict.keys():
                     # safe to just reset transform
                     geostruct.transform = transform
                 else:
-                    self.logger.warn("2) This will create a new copy of " "geostruct")
+                    logger.logged_warning("2) This will create a new copy of geostruct")
                     # to avoid flip flopping transform need to make a new geostruct
                     geostruct = copy.copy(geostruct)
                     geostruct.transform = transform
-                self.logger.warn(
-                    "-) Better to pass an appropriately " "transformed geostruct"
+                logger.logged_warning(
+                    "-) Better to pass an appropriately transformed geostruct"
                 )
 
         # Get useful variables from arguments passed
@@ -1810,10 +1877,11 @@ class PstFrom(object):
                     o_idx = np.argsort(keys)
                     xy_in_idx = o_idx[np.searchsorted(keys[o_idx], ["x", "y"])]
             else:
-                self.logger.lraise(
+                raise logger.logged_exception(
                     "If passing `index_cols` as type == dict, "
                     "keys need to contain [`i` and `j`] or "
-                    "[`x` and `y`]"
+                    "[`x` and `y`]",
+                    ValueError,
                 )
 
         (
@@ -1837,7 +1905,7 @@ class PstFrom(object):
             # TODO: something needed here to allow a different relative point.
             datetime = _get_datetime_from_str(datetime)
             if self.start_datetime is None:
-                self.logger.warn(
+                logger.logged_warning(
                     "NO START_DATEIME PROVIDED, ASSUMING PAR "
                     "DATETIME IS START {}".format(datetime)
                 )
@@ -1858,10 +1926,11 @@ class PstFrom(object):
         elif use_cols is not None and len(par_name_base) == len(use_cols):
             pass
         else:
-            self.logger.lraise(
+            raise logger.logged_exception(
                 "par_name_base should be a string, "
                 "single-element container, or container of "
-                f"len use_cols, not '{str(par_name_base)}'"
+                f"len use_cols, not '{str(par_name_base)}'",
+                ValueError,
             )
 
         # otherewise, things get tripped up in the ensemble/cov stuff
@@ -1931,463 +2000,467 @@ class PstFrom(object):
             lower_bound = _check_var_len(lower_bound, ncol, fill="first")
             upper_bound = _check_var_len(upper_bound, ncol, fill="first")
             if len(use_cols) != len(ult_lbound) != len(ult_ubound):
-                self.logger.lraise(
+                raise logger.logged_exception(
                     "mismatch in number of columns to use {0} "
                     "and number of ultimate lower {0} or upper "
                     "{1} par bounds defined"
-                    "".format(len(use_cols), len(ult_lbound), len(ult_ubound))
+                    "".format(len(use_cols), len(ult_lbound), len(ult_ubound)),
+                    ValueError,
                 )
 
-            self.logger.log(
+            with logger.timed_info(
                 "writing list-style template file '{0}'".format(tpl_filename)
-            )
-            # Generate tabular type template - also returns par data
-            # relative file paths are in file_dict as Path instances (kludgey)
-            dfs = [file_dict[Path(filename)] for filename in filenames]
-            get_xy = None
-            if (
-                par_type.startswith("grid") or par_type.startswith("p")
-            ) and geostruct is not None:
-                get_xy = self.get_xy
-            df = write_list_tpl(
-                filenames,
-                dfs,
-                par_name_base,
-                tpl_filename=tpl_filename,
-                par_type=par_type,
-                suffix="",
-                index_cols=index_cols,
-                use_cols=use_cols,
-                use_rows=use_rows,
-                zone_array=zone_array,
-                gpname=pargp,
-                longnames=self.longnames,
-                ij_in_idx=ij_in_idx,
-                xy_in_idx=xy_in_idx,
-                get_xy=get_xy,
-                zero_based=self.zero_based,
-                input_filename=in_fileabs,
-                par_style=par_style,
-                headerlines=headerlines,
-                fill_value=initial_value,
-                logger=self.logger,
-            )
-            assert (
-                np.mod(len(df), len(use_cols)) == 0.0
-            ), "Parameter dataframe wrong shape for number of cols {0}" "".format(
-                use_cols
-            )
-            # variables need to be passed to each row in df
-            lower_bound = np.tile(lower_bound, int(len(df) / ncol))
-            upper_bound = np.tile(upper_bound, int(len(df) / ncol))
-            self.logger.log(
-                "writing list-style template file '{0}'".format(tpl_filename)
-            )
-        else:  # Assume array type parameter file
-            self.logger.log(
-                "writing array-style template file '{0}'".format(tpl_filename)
-            )
-            if pargp is None:
-                pargp = par_name_base[0]
-            shp = file_dict[list(file_dict.keys())[0]].shape
-            # ARRAY constant, zones or grid (cell-by-cell)
-            if par_type in {"constant", "zone", "grid"}:
-                self.logger.log(
-                    "writing template file "
-                    "{0} for {1}".format(tpl_filename, par_name_base)
-                )
-                # Generate array type template - also returns par data
-                df = write_array_tpl(
-                    name=par_name_base[0],
+            ):
+                # Generate tabular type template - also returns par data
+                # relative file paths are in file_dict as Path instances (kludgey)
+                dfs = [file_dict[Path(filename)] for filename in filenames]
+                get_xy = None
+                if (
+                    par_type.startswith("grid") or par_type.startswith("p")
+                ) and geostruct is not None:
+                    get_xy = self.get_xy
+                df = write_list_tpl(
+                    filenames,
+                    dfs,
+                    par_name_base,
                     tpl_filename=tpl_filename,
-                    suffix="",
                     par_type=par_type,
+                    suffix="",
+                    index_cols=index_cols,
+                    use_cols=use_cols,
+                    use_rows=use_rows,
                     zone_array=zone_array,
-                    shape=shp,
-                    longnames=self.longnames,
-                    get_xy=self.get_xy,
-                    fill_value=1.0,
                     gpname=pargp,
+                    longnames=self.longnames,
+                    ij_in_idx=ij_in_idx,
+                    xy_in_idx=xy_in_idx,
+                    get_xy=get_xy,
+                    zero_based=self.zero_based,
                     input_filename=in_fileabs,
                     par_style=par_style,
+                    headerlines=headerlines,
+                    fill_value=initial_value,
+                    logger=logger,
                 )
-                self.logger.log(
-                    "writing template file"
-                    " {0} for {1}".format(tpl_filename, par_name_base)
+                assert (
+                    np.mod(len(df), len(use_cols)) == 0.0
+                ), "Parameter dataframe wrong shape for number of cols {0}" "".format(
+                    use_cols
                 )
-            # ARRAY PILOTPOINT setup
-            elif par_type in {
-                "pilotpoints",
-                "pilot_points",
-                "pilotpoint",
-                "pilot_point",
-                "pilot-point",
-                "pilot-points",
-            }:
-                if par_style == "d":
-                    self.logger.lraise(
-                        "pilot points not supported for 'direct' par_style"
-                    )
-                # Setup pilotpoints for array type par files
-                self.logger.log("setting up pilot point parameters")
-                # finding spatial references for for setting up pilot points
-                if spatial_reference is None:
-                    # if none passed with add_pars call
-                    self.logger.statement(
-                        "No spatial reference " "(containing cell spacing) passed."
-                    )
-                    if self.spatial_reference is not None:
-                        # using global sr on PstFrom object
-                        self.logger.statement(
-                            "OK - using spatial reference " "in parent object."
-                        )
-                        spatial_reference = self.spatial_reference
-                    else:
-                        # uhoh
-                        self.logger.lraise(
-                            "No spatial reference in parent "
-                            "object either. "
-                            "Can't set-up pilotpoints"
-                        )
-                # check that spatial reference lines up with the original array dimensions
-                structured = False
-                if not isinstance(spatial_reference, dict):
-                    structured = True
-                    for mod_file, ar in file_dict.items():
-                        orgdata = ar.shape
-                        assert orgdata[0] == spatial_reference.nrow, (
-                            "Spatial reference nrow not equal to original data nrow for\n"
-                            + os.path.join(
-                                *os.path.split(self.original_file_d)[1:], mod_file
-                            )
-                        )
-                        assert orgdata[1] == spatial_reference.ncol, (
-                            "Spatial reference ncol not equal to original data ncol for\n"
-                            + os.path.join(
-                                *os.path.split(self.original_file_d)[1:], mod_file
-                            )
-                        )
-                # (stolen from helpers.PstFromFlopyModel()._pp_prep())
-                # but only settting up one set of pps at a time
-                pnb = par_name_base[0]
-                if self.longnames:
-                    pnb = "pname:{1}_ptype:pp_pstyle:{0}".format(par_style, pnb)
-                pp_dict = {0: pnb}
-                pp_filename = "{0}pp.dat".format(par_name_store)
-                # pst inputfile (for tpl->in pair) is
-                # par_name_storepp.dat table (in pst ws)
-                in_filepst = pp_filename
-                pp_filename_dict = {pnb: in_filepst}
-                tpl_filename = self.tpl_d / (pp_filename + ".tpl")
-                # tpl_filename = get_relative_filepath(self.new_d, tpl_filename)
-                pp_locs = None
-                if pp_space is None:  # default spacing if not passed
-                    self.logger.warn("pp_space is None, using 10...\n")
-                    pp_space = 10
-                else:
-                    if not use_pp_zones and (isinstance(pp_space, int)):
-                        # if not using pp zones will set up pp for just one
-                        # zone (all non zero) -- for active domain...
-                        zone_array[zone_array > 0] = 1  # so can set all
-                        # gt-zero to 1
-                    if isinstance(pp_space, float):
-                        pp_space = int(pp_space)
-                    elif isinstance(pp_space, int):
-                        pass
-                    elif isinstance(pp_space, str):
-
-                        if pp_space.lower().strip().endswith(".csv"):
-                            self.logger.statement(
-                                "trying to load pilot point location info from csv file '{0}'".format(
-                                    self.new_d / Path(pp_space)
-                                )
-                            )
-                            pp_locs = pd.read_csv(self.new_d / pp_space)
-
-                        elif pp_space.lower().strip().endswith(".shp"):
-                            self.logger.statement(
-                                "trying to load pilot point location info from shapefile '{0}'".format(
-                                    self.new_d / Path(pp_space)
-                                )
-                            )
-                            pp_locs = pyemu.pp_utils.pilot_points_from_shapefile(
-                                str(self.new_d / Path(pp_space))
-                            )
-                        else:
-                            self.logger.statement(
-                                "trying to load pilot point location info from pilot point file '{0}'".format(
-                                    self.new_d / Path(pp_space)
-                                )
-                            )
-                            pp_locs = pyemu.pp_utils.pp_file_to_dataframe(
-                                self.new_d / pp_space
-                            )
-                        self.logger.statement(
-                            "pilot points found in file '{0}' will be transferred to '{1}' for parameterization".format(
-                                pp_space, pp_filename
-                            )
-                        )
-                    elif isinstance(pp_space, pd.DataFrame):
-                        pp_locs = pp_space
-                    else:
-                        self.logger.lraise(
-                            "unrecognized 'pp_space' value, should be int, csv file, pp file or dataframe, not '{0}'".format(
-                                type(pp_space)
-                            )
-                        )
-                    if pp_locs is not None:
-                        cols = pp_locs.columns.tolist()
-                        if "name" not in cols:
-                            self.logger.lraise("'name' col not found in pp dataframe")
-                        if "x" not in cols:
-                            self.logger.lraise("'x' col not found in pp dataframe")
-                        if "y" not in cols:
-                            self.logger.lraise("'y' col not found in pp dataframe")
-                        if "zone" not in cols:
-                            self.logger.warn(
-                                "'zone' col not found in pp dataframe, adding generic zone"
-                            )
-                            pp_locs.loc[:, "zone"] = 1
-                        elif zone_array is not None:
-                            # check that all the zones in the pp df are in the zone array
-                            missing = []
-                            for uz in pp_locs.zone.unique():
-                                if int(uz) not in zone_array:
-                                    missing.append(str(uz))
-                            if len(missing) > 0:
-                                self.logger.lraise(
-                                    "the following pp zone values were not found in the zone array: {0}".format(
-                                        ",".join(missing)
-                                    )
-                                )
-
-                            for uz in np.unique(zone_array):
-                                if uz < 1:
-                                    continue
-                                if uz not in pp_locs.zone.values:
-
-                                    missing.append(str(uz))
-                            if len(missing) > 0:
-                                self.logger.warn(
-                                    "the following zones don't have any pilot points:{0}".format(
-                                        ",".join(missing)
-                                    )
-                                )
-
-                if not structured and pp_locs is None:
-                    self.logger.lraise(
-                        "pilot point type parameters with an unstructured grid requires 'pp_space' "
-                        "contain explict pilot point information"
-                    )
-
-                if not structured and zone_array is not None:
-                    # self.logger.lraise("'zone_array' not supported for unstructured grids and pilot points")
-                    if "zone" not in pp_locs.columns:
-                        self.logger.lraise(
-                            "'zone' not found in pp info dataframe and 'zone_array' passed"
-                        )
-                    uvals = np.unique(zone_array)
-                    zvals = set([int(z) for z in pp_locs.zone.tolist()])
-                    missing = []
-                    for uval in uvals:
-                        if int(uval) not in zvals and int(uval) != 0:
-                            missing.append(str(int(uval)))
-                    if len(missing) > 0:
-                        self.logger.warn(
-                            "the following values in the zone array were not found in the pp info: {0}".format(
-                                ",".join(missing)
-                            )
-                        )
-
-                if geostruct is None:  # need a geostruct for pilotpoints
-
-                    # can use model default, if provided
-                    if self.geostruct is None:  # but if no geostruct passed...
-                        if not structured:
-                            self.logger.lraise(
-                                "pilot point type parameters with an unstructured grid requires an"
-                                " explicit `geostruct` arg be passed to either PstFrom or add_parameters()"
-                            )
-                        self.logger.warn(
-                            "pp_geostruct is None,"
-                            "using ExpVario with contribution=1 "
-                            "and a=(pp_space*max(delr,delc))"
-                        )
-                        # set up a default - could probably do something better if pp locs are passed
-                        if not isinstance(pp_space, int):
-                            space = 10
-                        else:
-                            space = pp_space
-                        pp_dist = space * float(
-                            max(
-                                spatial_reference.delr.max(),
-                                spatial_reference.delc.max(),
-                            )
-                        )
-                        v = pyemu.geostats.ExpVario(contribution=1.0, a=pp_dist)
-                        pp_geostruct = pyemu.geostats.GeoStruct(
-                            variograms=v, name="pp_geostruct", transform=transform
-                        )
-                    else:
-                        pp_geostruct = self.geostruct
-                        if pp_geostruct.transform != transform:
-                            self.logger.warn(
-                                "0) Inconsistency between "
-                                "pp_geostruct transform and "
-                                "partrans."
-                            )
-                            self.logger.warn(
-                                "1) Setting pp_geostruct transform "
-                                "to {0}".format(transform)
-                            )
-                            self.logger.warn(
-                                "2) This will create a new copy of " "pp_geostruct"
-                            )
-                            self.logger.warn(
-                                "3) Better to pass an appropriately "
-                                "transformed geostruct"
-                            )
-                            pp_geostruct = copy.copy(pp_geostruct)
-                            pp_geostruct.transform = transform
-                else:
-                    pp_geostruct = geostruct
-
-                if pp_locs is None:
-                    # Set up pilot points
-
-                    df = pyemu.pp_utils.setup_pilotpoints_grid(
-                        sr=spatial_reference,
-                        ibound=zone_array,
-                        use_ibound_zones=use_pp_zones,
-                        prefix_dict=pp_dict,
-                        every_n_cell=pp_space,
-                        pp_dir=self.new_d,
-                        tpl_dir=self.tpl_d,
-                        shapename=str(self.new_d / "{0}.shp".format(par_name_store)),
-                        longnames=self.longnames,
-                        pp_filename_dict=pp_filename_dict,
-                    )
-                else:
-
-                    df = pyemu.pp_utils.pilot_points_to_tpl(
-                        pp_locs,
-                        tpl_filename,
-                        pnb,
-                        longnames=self.longnames,
-                    )
-                df.loc[:, "pargp"] = pargp
-
-                df.set_index("parnme", drop=False, inplace=True)
-                # df includes most of the par info for par_dfs and also for
-                # relate_parfiles
-                self.logger.statement(
-                    "{0} pilot point parameters created".format(df.shape[0])
-                )
-                # should be only one group at a time
-                pargp = df.pargp.unique()
-                self.logger.statement("pilot point 'pargp':{0}".format(",".join(pargp)))
-                self.logger.log("setting up pilot point parameters")
-
-                # Calculating pp factors
-                pg = pargp[0]
-                # this reletvively quick
-                ok_pp = pyemu.geostats.OrdinaryKrige(pp_geostruct, df)
-                # build krige reference information on the fly - used to help
-                # prevent unnecessary krig factor calculation
-                pp_info_dict = {
-                    "pp_data": ok_pp.point_data.loc[:, ["x", "y", "zone"]],
-                    "cov": ok_pp.point_cov_df,
-                    "zn_ar": zone_array,
-                    "sr": spatial_reference,
-                }
-                fac_processed = False
-                for facfile, info in self._pp_facs.items():  # check against
-                    # factors already calculated
-                    if (
-                        info["pp_data"].equals(pp_info_dict["pp_data"])
-                        and info["cov"].equals(pp_info_dict["cov"])
-                        and np.array_equal(info["zn_ar"], pp_info_dict["zn_ar"])
+                # variables need to be passed to each row in df
+                lower_bound = np.tile(lower_bound, int(len(df) / ncol))
+                upper_bound = np.tile(upper_bound, int(len(df) / ncol))
+        else:  # Assume array type parameter file
+            with logger.timed_info(
+                "writing array-style template file '{0}'".format(tpl_filename)
+            ):
+                if pargp is None:
+                    pargp = par_name_base[0]
+                shp = file_dict[list(file_dict.keys())[0]].shape
+                # ARRAY constant, zones or grid (cell-by-cell)
+                if par_type in {"constant", "zone", "grid"}:
+                    with logger.timed_info(
+                        "writing template file "
+                        "{0} for {1}".format(tpl_filename, par_name_base)
                     ):
-                        if type(info["sr"]) == type(spatial_reference):
-                            if isinstance(spatial_reference, dict):
-                                if len(info["sr"]) != len(spatial_reference):
-                                    continue
-                        else:
-                            continue
-
-                        fac_processed = True  # don't need to re-calc same factors
-                        fac_filename = facfile  # relate to existing fac file
-                        break
-                if not fac_processed:
-                    # TODO need better way of naming sequential fac_files?
-                    self.logger.log("calculating factors for pargp={0}".format(pg))
-                    fac_filename = self.new_d / "{0}pp.fac".format(par_name_store)
-                    var_filename = fac_filename.with_suffix(".var.dat")
-                    self.logger.statement(
-                        "saving krige variance file:{0}".format(var_filename)
-                    )
-                    self.logger.statement(
-                        "saving krige factors file:{0}".format(fac_filename)
-                    )
-                    # store info on pilotpoints
-                    self._pp_facs[fac_filename] = pp_info_dict
-                    # this is slow (esp on windows) so only want to do this
-                    # when required
-                    if structured:
-                        ok_pp.calc_factors_grid(
-                            spatial_reference,
-                            var_filename=var_filename,
+                        # Generate array type template - also returns par data
+                        df = write_array_tpl(
+                            name=par_name_base[0],
+                            tpl_filename=tpl_filename,
+                            suffix="",
+                            par_type=par_type,
                             zone_array=zone_array,
-                            num_threads=10,
+                            shape=shp,
+                            longnames=self.longnames,
+                            get_xy=self.get_xy,
+                            fill_value=1.0,
+                            gpname=pargp,
+                            input_filename=in_fileabs,
+                            par_style=par_style,
                         )
-                        ok_pp.to_grid_factors_file(fac_filename)
+                # ARRAY PILOTPOINT setup
+                elif par_type in {
+                    "pilotpoints",
+                    "pilot_points",
+                    "pilotpoint",
+                    "pilot_point",
+                    "pilot-point",
+                    "pilot-points",
+                }:
+                    if par_style == "d":
+                        raise logger.logged_exception(
+                            "pilot points not supported for 'direct' par_style"
+                        )
+                    # Setup pilotpoints for array type par files
+                    logger.old_log("setting up pilot point parameters")
+                    # finding spatial references for for setting up pilot points
+                    if spatial_reference is None:
+                        # if none passed with add_pars call
+                        logger.info(
+                            "No spatial reference " "(containing cell spacing) passed."
+                        )
+                        if self.spatial_reference is not None:
+                            # using global sr on PstFrom object
+                            logger.info(
+                                "OK - using spatial reference " "in parent object."
+                            )
+                            spatial_reference = self.spatial_reference
+                        else:
+                            # uhoh
+                            raise logger.logged_exception(
+                                "No spatial reference in parent "
+                                "object either. "
+                                "Can't set-up pilotpoints"
+                            )
+                    # check that spatial reference lines up with the original array dimensions
+                    structured = False
+                    if not isinstance(spatial_reference, dict):
+                        structured = True
+                        for mod_file, ar in file_dict.items():
+                            orgdata = ar.shape
+                            assert orgdata[0] == spatial_reference.nrow, (
+                                "Spatial reference nrow not equal to original data nrow for\n"
+                                + os.path.join(
+                                    *os.path.split(self.original_file_d)[1:], mod_file
+                                )
+                            )
+                            assert orgdata[1] == spatial_reference.ncol, (
+                                "Spatial reference ncol not equal to original data ncol for\n"
+                                + os.path.join(
+                                    *os.path.split(self.original_file_d)[1:], mod_file
+                                )
+                            )
+                    # (stolen from helpers.PstFromFlopyModel()._pp_prep())
+                    # but only settting up one set of pps at a time
+                    pnb = par_name_base[0]
+                    if self.longnames:
+                        pnb = "pname:{1}_ptype:pp_pstyle:{0}".format(par_style, pnb)
+                    pp_dict = {0: pnb}
+                    pp_filename = "{0}pp.dat".format(par_name_store)
+                    # pst inputfile (for tpl->in pair) is
+                    # par_name_storepp.dat table (in pst ws)
+                    in_filepst = pp_filename
+                    pp_filename_dict = {pnb: in_filepst}
+                    tpl_filename = self.tpl_d / (pp_filename + ".tpl")
+                    # tpl_filename = get_relative_filepath(self.new_d, tpl_filename)
+                    pp_locs = None
+                    if pp_space is None:  # default spacing if not passed
+                        logger.logged_warning("pp_space is None, using 10...\n")
+                        pp_space = 10
                     else:
-                        # put the sr dict info into a df
-                        # but we only want to use the n
-                        if zone_array is not None:
-                            for zone in np.unique(zone_array):
-                                if int(zone) == 0:
-                                    continue
+                        if not use_pp_zones and (isinstance(pp_space, int)):
+                            # if not using pp zones will set up pp for just one
+                            # zone (all non zero) -- for active domain...
+                            zone_array[zone_array > 0] = 1  # so can set all
+                            # gt-zero to 1
+                        if isinstance(pp_space, float):
+                            pp_space = int(pp_space)
+                        elif isinstance(pp_space, int):
+                            pass
+                        elif isinstance(pp_space, str):
 
+                            if pp_space.lower().strip().endswith(".csv"):
+                                logger.info(
+                                    "trying to load pilot point location info from csv file '{0}'".format(
+                                        self.new_d / Path(pp_space)
+                                    )
+                                )
+                                pp_locs = pd.read_csv(self.new_d / pp_space)
+
+                            elif pp_space.lower().strip().endswith(".shp"):
+                                logger.info(
+                                    "trying to load pilot point location info from shapefile '{0}'".format(
+                                        self.new_d / Path(pp_space)
+                                    )
+                                )
+                                pp_locs = pyemu.pp_utils.pilot_points_from_shapefile(
+                                    str(self.new_d / Path(pp_space))
+                                )
+                            else:
+                                logger.info(
+                                    "trying to load pilot point location info from pilot point file '{0}'".format(
+                                        self.new_d / Path(pp_space)
+                                    )
+                                )
+                                pp_locs = pyemu.pp_utils.pp_file_to_dataframe(
+                                    self.new_d / pp_space
+                                )
+                            logger.info(
+                                "pilot points found in file '{0}' will be transferred to '{1}' for parameterization".format(
+                                    pp_space, pp_filename
+                                )
+                            )
+                        elif isinstance(pp_space, pd.DataFrame):
+                            pp_locs = pp_space
+                        else:
+                            raise logger.logged_exception(
+                                "unrecognized 'pp_space' value, should be int, csv file, pp file or dataframe, not '{0}'".format(
+                                    type(pp_space)
+                                )
+                            )
+                        if pp_locs is not None:
+                            cols = pp_locs.columns.tolist()
+                            if "name" not in cols:
+                                raise logger.logged_exception(
+                                    "'name' col not found in pp dataframe"
+                                )
+                            if "x" not in cols:
+                                raise logger.logged_exception(
+                                    "'x' col not found in pp dataframe"
+                                )
+                            if "y" not in cols:
+                                raise logger.logged_exception(
+                                    "'y' col not found in pp dataframe"
+                                )
+                            if "zone" not in cols:
+                                logger.logged_warning(
+                                    "'zone' col not found in pp dataframe, adding generic zone"
+                                )
+                                pp_locs.loc[:, "zone"] = 1
+                            elif zone_array is not None:
+                                # check that all the zones in the pp df are in the zone array
+                                missing = []
+                                for uz in pp_locs.zone.unique():
+                                    if int(uz) not in zone_array:
+                                        missing.append(str(uz))
+                                if len(missing) > 0:
+                                    raise logger.logged_exception(
+                                        "the following pp zone values were not found in the zone array: {0}".format(
+                                            ",".join(missing)
+                                        )
+                                    )
+
+                                for uz in np.unique(zone_array):
+                                    if uz < 1:
+                                        continue
+                                    if uz not in pp_locs.zone.values:
+
+                                        missing.append(str(uz))
+                                if len(missing) > 0:
+                                    logger.logged_warning(
+                                        "the following zones don't have any pilot points:{0}".format(
+                                            ",".join(missing)
+                                        )
+                                    )
+
+                    if not structured and pp_locs is None:
+                        raise logger.logged_exception(
+                            "pilot point type parameters with an unstructured grid requires 'pp_space' "
+                            "contain explict pilot point information"
+                        )
+
+                    if not structured and zone_array is not None:
+                        # raise logger.logged_exception("'zone_array' not supported for unstructured grids and pilot points")
+                        if "zone" not in pp_locs.columns:
+                            raise logger.logged_exception(
+                                "'zone' not found in pp info dataframe and 'zone_array' passed"
+                            )
+                        uvals = np.unique(zone_array)
+                        zvals = set([int(z) for z in pp_locs.zone.tolist()])
+                        missing = []
+                        for uval in uvals:
+                            if int(uval) not in zvals and int(uval) != 0:
+                                missing.append(str(int(uval)))
+                        if len(missing) > 0:
+                            logger.logged_warning(
+                                "the following values in the zone array were not found in the pp info: {0}".format(
+                                    ",".join(missing)
+                                )
+                            )
+
+                    if geostruct is None:  # need a geostruct for pilotpoints
+
+                        # can use model default, if provided
+                        if self.geostruct is None:  # but if no geostruct passed...
+                            if not structured:
+                                raise logger.logged_exception(
+                                    "pilot point type parameters with an unstructured grid requires an"
+                                    " explicit `geostruct` arg be passed to either PstFrom or add_parameters()"
+                                )
+                            logger.logged_warning(
+                                "pp_geostruct is None,"
+                                "using ExpVario with contribution=1 "
+                                "and a=(pp_space*max(delr,delc))"
+                            )
+                            # set up a default - could probably do something better if pp locs are passed
+                            if not isinstance(pp_space, int):
+                                space = 10
+                            else:
+                                space = pp_space
+                            pp_dist = space * float(
+                                max(
+                                    spatial_reference.delr.max(),
+                                    spatial_reference.delc.max(),
+                                )
+                            )
+                            v = pyemu.geostats.ExpVario(contribution=1.0, a=pp_dist)
+                            pp_geostruct = pyemu.geostats.GeoStruct(
+                                variograms=v, name="pp_geostruct", transform=transform
+                            )
+                        else:
+                            pp_geostruct = self.geostruct
+                            if pp_geostruct.transform != transform:
+                                logger.logged_warning(
+                                    "0) Inconsistency between "
+                                    "pp_geostruct transform and "
+                                    "partrans."
+                                )
+                                logger.logged_warning(
+                                    "1) Setting pp_geostruct transform "
+                                    "to {0}".format(transform)
+                                )
+                                logger.logged_warning(
+                                    "2) This will create a new copy of " "pp_geostruct"
+                                )
+                                logger.logged_warning(
+                                    "3) Better to pass an appropriately "
+                                    "transformed geostruct"
+                                )
+                                pp_geostruct = copy.copy(pp_geostruct)
+                                pp_geostruct.transform = transform
+                    else:
+                        pp_geostruct = geostruct
+
+                    if pp_locs is None:
+                        # Set up pilot points
+
+                        df = pyemu.pp_utils.setup_pilotpoints_grid(
+                            sr=spatial_reference,
+                            ibound=zone_array,
+                            use_ibound_zones=use_pp_zones,
+                            prefix_dict=pp_dict,
+                            every_n_cell=pp_space,
+                            pp_dir=self.new_d,
+                            tpl_dir=self.tpl_d,
+                            shapename=str(
+                                self.new_d / "{0}.shp".format(par_name_store)
+                            ),
+                            longnames=self.longnames,
+                            pp_filename_dict=pp_filename_dict,
+                        )
+                    else:
+
+                        df = pyemu.pp_utils.pilot_points_to_tpl(
+                            pp_locs,
+                            tpl_filename,
+                            pnb,
+                            longnames=self.longnames,
+                        )
+                    df.loc[:, "pargp"] = pargp
+
+                    df.set_index("parnme", drop=False, inplace=True)
+                    # df includes most of the par info for par_dfs and also for
+                    # relate_parfiles
+                    logger.info(
+                        "{0} pilot point parameters created".format(df.shape[0])
+                    )
+                    # should be only one group at a time
+                    pargp = df.pargp.unique()
+                    logger.info("pilot point 'pargp':{0}".format(",".join(pargp)))
+                    logger.old_log("setting up pilot point parameters")
+
+                    # Calculating pp factors
+                    pg = pargp[0]
+                    # this reletvively quick
+                    ok_pp = pyemu.geostats.OrdinaryKrige(pp_geostruct, df)
+                    # build krige reference information on the fly - used to help
+                    # prevent unnecessary krig factor calculation
+                    pp_info_dict = {
+                        "pp_data": ok_pp.point_data.loc[:, ["x", "y", "zone"]],
+                        "cov": ok_pp.point_cov_df,
+                        "zn_ar": zone_array,
+                        "sr": spatial_reference,
+                    }
+                    fac_processed = False
+                    for facfile, info in self._pp_facs.items():  # check against
+                        # factors already calculated
+                        if (
+                            info["pp_data"].equals(pp_info_dict["pp_data"])
+                            and info["cov"].equals(pp_info_dict["cov"])
+                            and np.array_equal(info["zn_ar"], pp_info_dict["zn_ar"])
+                        ):
+                            if type(info["sr"]) == type(spatial_reference):
+                                if isinstance(spatial_reference, dict):
+                                    if len(info["sr"]) != len(spatial_reference):
+                                        continue
+                            else:
+                                continue
+
+                            fac_processed = True  # don't need to re-calc same factors
+                            fac_filename = facfile  # relate to existing fac file
+                            break
+                    if not fac_processed:
+                        # TODO need better way of naming sequential fac_files?
+                        logger.old_log("calculating factors for pargp={0}".format(pg))
+                        fac_filename = self.new_d / "{0}pp.fac".format(par_name_store)
+                        var_filename = fac_filename.with_suffix(".var.dat")
+                        logger.info(
+                            "saving krige variance file:{0}".format(var_filename)
+                        )
+                        logger.info(
+                            "saving krige factors file:{0}".format(fac_filename)
+                        )
+                        # store info on pilotpoints
+                        self._pp_facs[fac_filename] = pp_info_dict
+                        # this is slow (esp on windows) so only want to do this
+                        # when required
+                        if structured:
+                            ok_pp.calc_factors_grid(
+                                spatial_reference,
+                                var_filename=var_filename,
+                                zone_array=zone_array,
+                                num_threads=10,
+                            )
+                            ok_pp.to_grid_factors_file(fac_filename)
+                        else:
+                            # put the sr dict info into a df
+                            # but we only want to use the n
+                            if zone_array is not None:
+                                for zone in np.unique(zone_array):
+                                    if int(zone) == 0:
+                                        continue
+
+                                    data = []
+                                    for node, (x, y) in spatial_reference.items():
+                                        if zone_array[0, node] == zone:
+                                            data.append([node, x, y])
+                                    if len(data) == 0:
+                                        continue
+                                    node_df = pd.DataFrame(
+                                        data, columns=["node", "x", "y"]
+                                    )
+                                    ok_pp.calc_factors(
+                                        node_df.x,
+                                        node_df.y,
+                                        num_threads=1,
+                                        pt_zone=zone,
+                                        idx_vals=node_df.node.astype(int),
+                                    )
+                                ok_pp.to_grid_factors_file(
+                                    fac_filename, ncol=len(spatial_reference)
+                                )
+                            else:
                                 data = []
                                 for node, (x, y) in spatial_reference.items():
-                                    if zone_array[0, node] == zone:
-                                        data.append([node, x, y])
-                                if len(data) == 0:
-                                    continue
+                                    data.append([node, x, y])
                                 node_df = pd.DataFrame(data, columns=["node", "x", "y"])
-                                ok_pp.calc_factors(
-                                    node_df.x,
-                                    node_df.y,
-                                    num_threads=1,
-                                    pt_zone=zone,
-                                    idx_vals=node_df.node.astype(int),
+                                ok_pp.calc_factors(node_df.x, node_df.y, num_threads=10)
+                                ok_pp.to_grid_factors_file(
+                                    fac_filename, ncol=node_df.shape[0]
                                 )
-                            ok_pp.to_grid_factors_file(
-                                fac_filename, ncol=len(spatial_reference)
-                            )
-                        else:
-                            data = []
-                            for node, (x, y) in spatial_reference.items():
-                                data.append([node, x, y])
-                            node_df = pd.DataFrame(data, columns=["node", "x", "y"])
-                            ok_pp.calc_factors(node_df.x, node_df.y, num_threads=10)
-                            ok_pp.to_grid_factors_file(
-                                fac_filename, ncol=node_df.shape[0]
-                            )
 
-                    self.logger.log("calculating factors for pargp={0}".format(pg))
-            # TODO - other par types - JTW?
-            elif par_type == "kl":
-                self.logger.lraise("array type 'kl' not implemented")
-            else:
-                self.logger.lraise(
-                    "unrecognized 'par_type': '{0}', "
-                    "should be in "
-                    "['constant','zone','grid','pilotpoints',"
-                    "'kl'"
-                )
-            self.logger.log(
+                        logger.old_log("calculating factors for pargp={0}".format(pg))
+                # TODO - other par types - JTW?
+                elif par_type == "kl":
+                    raise logger.logged_exception("array type 'kl' not implemented")
+                else:
+                    raise logger.logged_exception(
+                        "unrecognized 'par_type': '{0}', "
+                        "should be in "
+                        "['constant','zone','grid','pilotpoints',"
+                        "'kl'"
+                    )
+            logger.old_log(
                 "writing array-based template file " "'{0}'".format(tpl_filename)
             )
 
@@ -2403,7 +2476,7 @@ class PstFrom(object):
         if zone_array is not None and zone_array.ndim < 3:
             # zone_filename = tpl_filename.replace(".tpl",".zone")
             zone_filename = Path(str(tpl_filename).replace(".tpl", ".zone"))
-            self.logger.statement(
+            logger.info(
                 "saving zone array {0} for tpl file {1}".format(
                     zone_filename, tpl_filename
                 )
@@ -2526,22 +2599,18 @@ class PstFrom(object):
             # geostruct = pyemu.geostats.GeoStruct(
             #     variograms=v)
 
-        self.logger.log(
-            "adding {0} type {1} style parameters for file(s) {2}".format(
-                par_type, par_style, [str(f) for f in filenames]
-            )
-        )
+        add_par_timer.finish()
 
         if rebuild_pst:  # may want to just update pst and rebuild
             # (with new relations)
             if self.pst is not None:
-                self.logger.log("Adding pars to control file " "and rewriting pst")
-                self.build_pst(filename=self.pst.filename, update="pars")
+                with logger.timed_info("Adding pars to control file and rewriting pst"):
+                    self.build_pst(filename=self.pst.filename, update="pars")
             else:
-                self.build_pst(filename=self.pst.filename, update=False)
-                self.logger.warn(
-                    "pst object not available, " "new control file will be written"
+                logger.logged_warning(
+                    "pst object not available, new control file will be written"
                 )
+                self.build_pst(update=False)
         return df
 
     def _load_listtype_file(
@@ -2578,7 +2647,7 @@ class PstFrom(object):
             if len(check_args) > 1:
                 #  implies neither are None but they either both are not str,int
                 #  or are different
-                self.logger.lraise(
+                raise self.logger.logged_exception(
                     "unrecognized type for index_cols or use_cols "
                     "should be str or int and both should be of the "
                     "same type, not {0} or {1}".format(
@@ -2587,7 +2656,7 @@ class PstFrom(object):
                 )
             else:
                 # implies not correct type
-                self.logger.lraise(
+                raise self.logger.logged_exception(
                     "unrecognized type for either index_cols or use_cols "
                     "should be str or int, not {0}".format(type(check_args[0][0]))
                 )
@@ -2599,12 +2668,16 @@ class PstFrom(object):
 
             i = si.intersection(su)
             if len(i) > 0:
-                self.logger.lraise(f"use_cols also listed in index_cols: {str(i)}")
+                raise self.logger.logged_exception(
+                    f"use_cols also listed in index_cols: {str(i)}"
+                )
 
         file_path = self.new_d / filename
         if not os.path.exists(file_path):
-            self.logger.lraise(f"par/obs filename '{file_path}' not found ")
-        self.logger.log(f"reading list-style file: {file_path}")
+            raise self.logger.logged_exception(
+                f"par/obs filename '{file_path}' not found "
+            )
+        self.logger.old_log(f"reading list-style file: {file_path}")
         if fmt.lower() == "free":
             if sep is None:
                 sep = r"\s+"
@@ -2614,12 +2687,14 @@ class PstFrom(object):
             # TODO support reading fixed-format
             #  (based on value of fmt passed)
             #  ... or not?
-            self.logger.warn(
+            self.logger.logged_warning(
                 "0) Only reading free format list-style par "
                 "files currently supported."
             )
-            self.logger.warn("1) Assuming safe to read as whitespace delim.")
-            self.logger.warn("2) Desired format string will still be passed through")
+            self.logger.logged_warning("1) Assuming safe to read as whitespace delim.")
+            self.logger.logged_warning(
+                "2) Desired format string will still be passed through"
+            )
             sep = r"\s+"
         try:
             # read each input file
@@ -2655,7 +2730,7 @@ class PstFrom(object):
             header=header,
             low_memory=False,
         )
-        self.logger.log(f"reading list-style file: {file_path}")
+        self.logger.old_log(f"reading list-style file: {file_path}")
         # ensure that column ids from index_col is in input file
         missing = []
         for index_col in index_cols:
@@ -2663,7 +2738,7 @@ class PstFrom(object):
                 missing.append(index_col)
             # df.loc[:, index_col] = df.loc[:, index_col].astype(np.int64) # TODO int? why?
         if len(missing) > 0:
-            self.logger.lraise(
+            raise self.logger.logged_exception(
                 "the following index_cols were not "
                 "found in file '{0}':{1}"
                 "".format(file_path, str(missing))
@@ -2674,7 +2749,7 @@ class PstFrom(object):
                 if use_col not in df.columns:
                     missing.append(use_cols)
         if len(missing) > 0:
-            self.logger.lraise(
+            raise self.logger.logged_exception(
                 "the following use_cols were not found "
                 "in file '{0}':{1}"
                 "".format(file_path, str(missing))
@@ -2719,7 +2794,7 @@ class PstFrom(object):
         if not isinstance(fmts, list):
             fmts = [fmts]
         if len(fmts) != len(filenames):
-            self.logger.warn(
+            self.logger.logged_warning(
                 "Discrepancy between number of filenames ({0}) "
                 "and number of formatter strings ({1}). "
                 "Will repeat first ({2})"
@@ -2732,7 +2807,7 @@ class PstFrom(object):
         if not isinstance(seps, list):
             seps = [seps]
         if len(seps) != len(filenames):
-            self.logger.warn(
+            self.logger.logged_warning(
                 "Discrepancy between number of filenames ({0}) "
                 "and number of seps defined ({1}). "
                 "Will repeat first ({2})"
@@ -2744,7 +2819,7 @@ class PstFrom(object):
         if not isinstance(skip_rows, list):
             skip_rows = [skip_rows]
         if len(skip_rows) != len(filenames):
-            self.logger.warn(
+            self.logger.logged_warning(
                 "Discrepancy between number of filenames ({0}) "
                 "and number of skip_rows defined ({1}). "
                 "Will repeat first ({2})"
@@ -2754,7 +2829,7 @@ class PstFrom(object):
         skip_rows = [0 if s is None else s for s in skip_rows]
 
         if index_cols is None and use_cols is not None:
-            self.logger.lraise(
+            raise self.logger.logged_exception(
                 "index_cols is None, but use_cols is not ({0})" "".format(str(use_cols))
             )
 
@@ -3594,8 +3669,7 @@ def write_array_tpl(
                 par_style, name, i, j
             )
             if get_xy is not None:
-                pname += "_x:{0:0.2f}_y:{1:0.2f}".format(
-                    *get_xy([i, j], ij_id=[0, 1]))
+                pname += "_x:{0:0.2f}_y:{1:0.2f}".format(*get_xy([i, j], ij_id=[0, 1]))
             if zone_array is not None:
                 pname += "_zone:{0}".format(zone_array[i, j])
             if suffix != "":
