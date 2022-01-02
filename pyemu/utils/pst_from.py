@@ -5,10 +5,18 @@ import shutil
 import string
 import time
 import warnings
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Generic, Tuple, TypeVar
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Protocol,
+    Tuple,
+    TypeVar,
+    Union,
+    runtime_checkable,
+)
 
 import numpy as np
 import pandas as pd
@@ -25,6 +33,10 @@ DIRECT_PAR_PERCENT_DIFF_TOL = 1.0
 T = TypeVar("T")
 
 
+class AmbiguousIndex(Warning):
+    pass
+
+
 class SpatialReference(Generic[T]):
     def __init__(
         self,
@@ -38,11 +50,15 @@ class SpatialReference(Generic[T]):
         self.ijwarned: Dict[int, bool] = defaultdict(bool)
         self.add_pars_callcount: int = 0
 
-    def get_xy(self, args: Tuple[float,...], **kwargs: Any) -> Tuple[float, float]:
+    def get_xy(
+        self, args: Tuple[float, ...], **kwargs: Any
+    ) -> Union[Tuple[float, float], Tuple[None, None]]:
         return self._parse_kij_args(args, kwargs)
 
-    def _parse_kij_args(self, args: Tuple[float,...], kwargs: Dict[str, Any]) -> Tuple[float, float]:
-        """parse args into kij indices.  Called programmatically"""
+    def _parse_kij_args(
+        self, args: Tuple[float, ...], kwargs: Dict[str, Any]
+    ) -> Union[Tuple[float, float], Tuple[None, None]]:
+        """parse args into kij indices."""
         if len(args) >= 2:
             ij_id = None
             if "ij_id" in kwargs:
@@ -50,39 +66,130 @@ class SpatialReference(Generic[T]):
             if ij_id is not None:
                 i, j = [args[ij] for ij in ij_id]
             else:
-                if not self.ijwarned[self.add_pars_callcount]:
-                    self.logger.logged_warning(
-                        "get_xy() warning: position of i and j in index_cols "
-                        "not specified, assume (i,j) are final two entries in "
-                        "index_cols."
-                    )
-                    self.ijwarned[self.add_pars_callcount] = True
-                # assume i and j are the final two entries in index_cols
+                warnings.warn(
+                    "Position of i and j in index_cols not specified, "
+                    "assume (i,j) are final two entries in index_cols.",
+                    category=AmbiguousIndex,
+                    stacklevel=3,
+                )
                 i, j = args[-2], args[-1]
         else:
-            if not self.ijwarned[self.add_pars_callcount]:
-                self.logger.logged_warning(
-                    (
-                        "get_xy() warning: need locational information "
-                        "(e.g. i,j) to generate xy, "
-                        "insufficient index cols passed to interpret: {}"
-                        ""
-                    ).format(str(args))
-                )
-                self.ijwarned[self.add_pars_callcount] = True
+            warnings.warn(
+                "get_xy() warning: need locational information "
+                "(e.g. i,j) to generate xy, "
+                f"insufficient index cols passed to interpret: {args!s}",
+                category=AmbiguousIndex,
+                stacklevel=3,
+            )
             i, j = None, None
         return i, j
 
 
-class GenericSpatialReference(AbstractSpatialReference):
+class DictSpatialReference(
+    SpatialReference[Dict[Union[int, Tuple[int, ...]], Tuple[float, ...]]]
+):
     def __init__(
         self,
-        spatial_reference: T,
+        spatial_reference: Dict[Union[int, Tuple[int, ...]], Tuple[float, ...]],
         parent_logger: SuperLogger,
         *args: Any,
         **kwargs: Any,
     ) -> None:
         super().__init__(spatial_reference, parent_logger, *args, **kwargs)
+
+    def get_xy(
+        self, args: Tuple[int, ...], **kwargs: Any
+    ) -> Union[Tuple[float, float], Tuple[None, None]]:
+        if isinstance(args, list):
+            args = tuple(args)
+        xy = self._spatial_reference.get(args, None)
+        base_error_msg = f"error getting xy from arg:'{args}' - {{err}}"
+        if xy is None:
+            arg_len = None
+            try:
+                arg_len = len(args)
+            except TypeError as e:
+                msg = base_error_msg.format(err="no len support")
+                raise self.logger.logged_exception(msg, ValueError) from e
+            if arg_len == 1:
+                xy = self._spatial_reference.get(args[0], None)
+            elif arg_len == 2 and args[0] == 0:
+                xy = self._spatial_reference.get(args[1], None)
+            elif arg_len == 2 and args[1] == 0:
+                xy = self._spatial_reference.get(args[0], None)
+            else:
+                raise self.logger.logged_exception(
+                    base_error_msg.format(err="no value found"), ValueError
+                )
+        if xy is None:
+            raise self.logger.logged_exception(
+                base_error_msg.format(err="still None..."), ValueError
+            )
+        return xy[0], xy[1]
+
+
+@runtime_checkable
+class GetItem(Protocol):
+    def __getitem__(self, *keys: Any) -> Any:
+        pass
+
+
+@runtime_checkable
+class FlopySR(Protocol):
+    xcentergrid: GetItem
+    ycentergrid: GetItem
+
+
+@runtime_checkable
+class FlopyMG(Protocol):
+    xcellcenters: GetItem
+    ycellcenters: GetItem
+
+
+class FlopySRSpatialReference(SpatialReference[FlopySR]):
+    def __init__(
+        self,
+        spatial_reference: FlopySR,
+        parent_logger: SuperLogger,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(spatial_reference, parent_logger, *args, **kwargs)
+
+    def get_xy(
+        self, args: Tuple[float, ...], **kwargs: Any
+    ) -> Union[Tuple[float, float], Tuple[None, None]]:
+        i, j = self._parse_kij_args(args, kwargs)
+        if (i, j) == (None, None):
+            return i, j
+        else:
+            return (
+                self._spatial_reference.xcentergrid[i, j],
+                self._spatial_reference.ycentergrid[i, j],
+            )
+
+
+class FlopyMGSpatialReference(SpatialReference[FlopyMG]):
+    def __init__(
+        self,
+        spatial_reference: FlopyMG,
+        parent_logger: SuperLogger,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(spatial_reference, parent_logger, *args, **kwargs)
+
+    def get_xy(
+        self, args: Tuple[float, ...], **kwargs: Any
+    ) -> Union[Tuple[float, float], Tuple[None, None]]:
+        i, j = self._parse_kij_args(args, kwargs)
+        if (i, j) == (None, None):
+            return i, j
+        else:
+            return (
+                self._spatial_reference.xcellcenters[i, j],
+                self._spatial_reference.ycellcenters[i, j],
+            )
 
 
 def _get_datetime_from_str(sdt):
@@ -109,6 +216,26 @@ def _check_var_len(var, n, fill=None):
     if nv < n:
         var.extend([fill for _ in range(n - nv)])
     return var
+
+
+def _initialize_spatial_reference(
+    spatial_reference: Any, parent_logger: SuperLogger
+) -> SpatialReference:
+    """process the spatial reference argument.  Called programmatically"""
+    if spatial_reference is None:
+        return SpatialReference(spatial_reference, parent_logger)
+    elif isinstance(spatial_reference, FlopySR):
+        return FlopySRSpatialReference(spatial_reference, parent_logger)
+    elif isinstance(spatial_reference, FlopyMG):
+        return FlopyMGSpatialReference(spatial_reference, parent_logger)
+    elif isinstance(spatial_reference, dict):
+        parent_logger.info("dictionary-based spatial reference detected...")
+        return DictSpatialReference(spatial_reference, parent_logger)
+    else:
+        raise parent_logger.logged_exception(
+            "initialize_spatial_reference() error: unsupported spatial_reference",
+            TypeError,
+        )
 
 
 class PstFrom(object):
@@ -211,7 +338,9 @@ class PstFrom(object):
         self.get_xy = None
         self.add_pars_callcount = 0
         self.ijwarned = {}
-        self.initialize_spatial_reference()
+        self.spatial_reference = _initialize_spatial_reference(
+            spatial_reference, self.logger
+        )
 
         self._setup_dirs()
         self._parfile_relations = []
@@ -373,31 +502,6 @@ class PstFrom(object):
                 self.ijwarned[self.add_pars_callcount] = True
             i, j = None, None
         return i, j
-
-    def initialize_spatial_reference(self):
-        """process the spatial reference argument.  Called programmatically"""
-        if self._spatial_reference is None:
-            self.get_xy = self._generic_get_xy
-        elif hasattr(self._spatial_reference, "xcentergrid") and hasattr(
-            self._spatial_reference, "ycentergrid"
-        ):
-            self.get_xy = self._flopy_sr_get_xy
-        elif hasattr(self._spatial_reference, "xcellcenters") and hasattr(
-            self._spatial_reference, "ycellcenters"
-        ):
-            # support modelgrid style cell locs
-            self._spatial_reference.xcentergrid = self._spatial_reference.xcellcenters
-            self._spatial_reference.ycentergrid = self._spatial_reference.ycellcenters
-            self.get_xy = self._flopy_mg_get_xy
-        elif isinstance(self._spatial_reference, dict):
-            self.logger.info("dictionary-based spatial reference detected...")
-            self.get_xy = self._dict_get_xy
-        else:
-            raise self.logger.logged_exception(
-                "initialize_spatial_reference() error: unsupported spatial_reference",
-                TypeError,
-            )
-        self.spatial_reference = self._spatial_reference
 
     def write_forward_run(self):
         """write the forward run script.  Called by build_pst()"""
