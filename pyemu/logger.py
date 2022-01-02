@@ -104,6 +104,7 @@ def get_logger(name: str, filename: str = "", echo: bool = False) -> SuperLogger
         # remove the old handlers to configure the handlers according to the current call.
         for handler in logger.handlers:
             logger.removeHandler(handler)
+            handler.close()
         if not filename:
             filename = "{}.log".format(name)
         logger.addHandler(logging.FileHandler(filename, mode="w"))
