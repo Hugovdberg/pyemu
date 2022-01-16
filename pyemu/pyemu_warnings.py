@@ -10,3 +10,7 @@ warnings.formatwarning = warning_on_one_line
 
 class PyemuWarning(Warning):
     pass
+
+
+class AmbiguousIndex(PyemuWarning):
+    pass

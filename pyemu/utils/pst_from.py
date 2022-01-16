@@ -11,7 +11,10 @@ from typing import (
     Any,
     Dict,
     Generic,
+    List,
+    Literal,
     Protocol,
+    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -22,174 +25,17 @@ import numpy as np
 import pandas as pd
 import pyemu
 from pyemu.logger import SuperLogger, get_logger
+from pyemu.utils.spatial_reference import (
+    DictSpatialReference,
+    initialize_spatial_reference,
+)
 
-from ..pyemu_warnings import PyemuWarning
+from ..pyemu_warnings import AmbiguousIndex, PyemuWarning
 
 # the tolerable percent difference (100 * (max - min)/mean)
 # used when checking that constant and zone type parameters are in fact constant (within
 # a given zone)
 DIRECT_PAR_PERCENT_DIFF_TOL = 1.0
-
-T = TypeVar("T")
-
-
-class AmbiguousIndex(Warning):
-    pass
-
-
-class SpatialReference(Generic[T]):
-    def __init__(
-        self,
-        spatial_reference: T,
-        parent_logger: SuperLogger,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        self._spatial_reference = spatial_reference
-        self.logger = parent_logger.getChild(self.__class__.__name__)
-        self.ijwarned: Dict[int, bool] = defaultdict(bool)
-        self.add_pars_callcount: int = 0
-
-    def get_xy(
-        self, args: Tuple[float, ...], **kwargs: Any
-    ) -> Union[Tuple[float, float], Tuple[None, None]]:
-        return self._parse_kij_args(args, kwargs)
-
-    def _parse_kij_args(
-        self, args: Tuple[float, ...], kwargs: Dict[str, Any]
-    ) -> Union[Tuple[float, float], Tuple[None, None]]:
-        """parse args into kij indices."""
-        if len(args) >= 2:
-            ij_id = None
-            if "ij_id" in kwargs:
-                ij_id = kwargs["ij_id"]
-            if ij_id is not None:
-                i, j = [args[ij] for ij in ij_id]
-            else:
-                warnings.warn(
-                    "Position of i and j in index_cols not specified, "
-                    "assume (i,j) are final two entries in index_cols.",
-                    category=AmbiguousIndex,
-                    stacklevel=3,
-                )
-                i, j = args[-2], args[-1]
-        else:
-            warnings.warn(
-                "get_xy() warning: need locational information "
-                "(e.g. i,j) to generate xy, "
-                f"insufficient index cols passed to interpret: {args!s}",
-                category=AmbiguousIndex,
-                stacklevel=3,
-            )
-            i, j = None, None
-        return i, j
-
-
-class DictSpatialReference(
-    SpatialReference[Dict[Union[int, Tuple[int, ...]], Tuple[float, ...]]]
-):
-    def __init__(
-        self,
-        spatial_reference: Dict[Union[int, Tuple[int, ...]], Tuple[float, ...]],
-        parent_logger: SuperLogger,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(spatial_reference, parent_logger, *args, **kwargs)
-
-    def get_xy(
-        self, args: Tuple[int, ...], **kwargs: Any
-    ) -> Union[Tuple[float, float], Tuple[None, None]]:
-        if isinstance(args, list):
-            args = tuple(args)
-        xy = self._spatial_reference.get(args, None)
-        base_error_msg = f"error getting xy from arg:'{args}' - {{err}}"
-        if xy is None:
-            arg_len = None
-            try:
-                arg_len = len(args)
-            except TypeError as e:
-                msg = base_error_msg.format(err="no len support")
-                raise self.logger.logged_exception(msg, ValueError) from e
-            if arg_len == 1:
-                xy = self._spatial_reference.get(args[0], None)
-            elif arg_len == 2 and args[0] == 0:
-                xy = self._spatial_reference.get(args[1], None)
-            elif arg_len == 2 and args[1] == 0:
-                xy = self._spatial_reference.get(args[0], None)
-            else:
-                raise self.logger.logged_exception(
-                    base_error_msg.format(err="no value found"), ValueError
-                )
-        if xy is None:
-            raise self.logger.logged_exception(
-                base_error_msg.format(err="still None..."), ValueError
-            )
-        return xy[0], xy[1]
-
-
-@runtime_checkable
-class GetItem(Protocol):
-    def __getitem__(self, *keys: Any) -> Any:
-        pass
-
-
-@runtime_checkable
-class FlopySR(Protocol):
-    xcentergrid: GetItem
-    ycentergrid: GetItem
-
-
-@runtime_checkable
-class FlopyMG(Protocol):
-    xcellcenters: GetItem
-    ycellcenters: GetItem
-
-
-class FlopySRSpatialReference(SpatialReference[FlopySR]):
-    def __init__(
-        self,
-        spatial_reference: FlopySR,
-        parent_logger: SuperLogger,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(spatial_reference, parent_logger, *args, **kwargs)
-
-    def get_xy(
-        self, args: Tuple[float, ...], **kwargs: Any
-    ) -> Union[Tuple[float, float], Tuple[None, None]]:
-        i, j = self._parse_kij_args(args, kwargs)
-        if (i, j) == (None, None):
-            return i, j
-        else:
-            return (
-                self._spatial_reference.xcentergrid[i, j],
-                self._spatial_reference.ycentergrid[i, j],
-            )
-
-
-class FlopyMGSpatialReference(SpatialReference[FlopyMG]):
-    def __init__(
-        self,
-        spatial_reference: FlopyMG,
-        parent_logger: SuperLogger,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(spatial_reference, parent_logger, *args, **kwargs)
-
-    def get_xy(
-        self, args: Tuple[float, ...], **kwargs: Any
-    ) -> Union[Tuple[float, float], Tuple[None, None]]:
-        i, j = self._parse_kij_args(args, kwargs)
-        if (i, j) == (None, None):
-            return i, j
-        else:
-            return (
-                self._spatial_reference.xcellcenters[i, j],
-                self._spatial_reference.ycellcenters[i, j],
-            )
 
 
 def _get_datetime_from_str(sdt):
@@ -216,26 +62,6 @@ def _check_var_len(var, n, fill=None):
     if nv < n:
         var.extend([fill for _ in range(n - nv)])
     return var
-
-
-def _initialize_spatial_reference(
-    spatial_reference: Any, parent_logger: SuperLogger
-) -> SpatialReference:
-    """process the spatial reference argument.  Called programmatically"""
-    if spatial_reference is None:
-        return SpatialReference(spatial_reference, parent_logger)
-    elif isinstance(spatial_reference, FlopySR):
-        return FlopySRSpatialReference(spatial_reference, parent_logger)
-    elif isinstance(spatial_reference, FlopyMG):
-        return FlopyMGSpatialReference(spatial_reference, parent_logger)
-    elif isinstance(spatial_reference, dict):
-        parent_logger.info("dictionary-based spatial reference detected...")
-        return DictSpatialReference(spatial_reference, parent_logger)
-    else:
-        raise parent_logger.logged_exception(
-            "initialize_spatial_reference() error: unsupported spatial_reference",
-            TypeError,
-        )
 
 
 class PstFrom(object):
@@ -294,15 +120,15 @@ class PstFrom(object):
             self.tpl_d = Path(self.new_d, tpl_subfolder)
         self.remove_existing = bool(remove_existing)
         self.zero_based = bool(zero_based)
-        self._spatial_reference = spatial_reference
-        self._spatial_ref_xarray = None
-        self._spatial_ref_yarray = None
-        self.spatial_reference = None
+
+        self.spatial_reference = initialize_spatial_reference(
+            spatial_reference, self.logger
+        )
         if start_datetime is not None:
             start_datetime = _get_datetime_from_str(start_datetime)
         self.start_datetime = start_datetime
         self.geostruct = None
-        self.par_struct_dict = {}
+        self.par_struct_dict: Dict[str, Dict[str, List[pd.DataFrame]]] = {}
         # self.par_struct_dict_l = {}
 
         self.mult_files = []
@@ -335,12 +161,7 @@ class PstFrom(object):
 
         self._prefix_count = {}
 
-        self.get_xy = None
         self.add_pars_callcount = 0
-        self.ijwarned = {}
-        self.spatial_reference = _initialize_spatial_reference(
-            spatial_reference, self.logger
-        )
 
         self._setup_dirs()
         self._parfile_relations = []
@@ -388,7 +209,7 @@ class PstFrom(object):
             )
             if ubound.nunique(0, False).gt(1).any():
                 ub_min = ubound.min().fillna(self.ult_ubound_fill).to_dict()
-                pr.loc[g.index, "upper_bound"] = g.use_cols.apply(
+                pr.loc[g.index, "upper_bound"] = g.use_cols.apply(  # type: ignore
                     lambda x: [ub_min["ubound{0}".format(c)] for c in x]
                     if x is not None
                     else ub_min["ubound"]
@@ -408,100 +229,13 @@ class PstFrom(object):
             )
             if lbound.nunique(0, False).gt(1).any():
                 lb_max = lbound.max().fillna(self.ult_lbound_fill).to_dict()
-                pr.loc[g.index, "lower_bound"] = g.use_cols.apply(
+                pr.loc[g.index, "lower_bound"] = g.use_cols.apply(  # type: ignore
                     lambda x: [lb_max["lbound{0}".format(c)] for c in x]
                     if x is not None
                     else lb_max["lbound"]
                 )
         pr["zero_based"] = self.zero_based
         return pr
-
-    def _generic_get_xy(self, args, **kwargs):
-        i, j = self.parse_kij_args(args, kwargs)
-        return i, j
-
-    def _dict_get_xy(self, arg, **kwargs):
-        if isinstance(arg, list):
-            arg = tuple(arg)
-        xy = self._spatial_reference.get(arg, None)
-        base_error_msg = (
-            f"Pstfrom._dict_get_xy() error getting xy from arg:'{arg}' - {{err}}"
-        )
-        if xy is None:
-            arg_len = None
-            try:
-                arg_len = len(arg)
-            except Exception as e:
-                msg = base_error_msg.format(err="no len support")
-                raise self.logger.logged_exception(msg, ValueError) from e
-            if arg_len == 1:
-                xy = self._spatial_reference.get(arg[0], None)
-            elif arg_len == 2 and arg[0] == 0:
-                xy = self._spatial_reference.get(arg[1], None)
-            elif arg_len == 2 and arg[1] == 0:
-                xy = self._spatial_reference.get(arg[0], None)
-            else:
-                raise self.logger.logged_exception(
-                    base_error_msg.format(err="no value found"), ValueError
-                )
-        if xy is None:
-            raise self.logger.logged_exception(
-                base_error_msg.format(err="still None..."), ValueError
-            )
-        return xy[0], xy[1]
-
-    def _flopy_sr_get_xy(self, args, **kwargs):
-        i, j = self.parse_kij_args(args, kwargs)
-        if all([ij is None for ij in [i, j]]):
-            return i, j
-        else:
-            return (
-                self._spatial_reference.xcentergrid[i, j],
-                self._spatial_reference.ycentergrid[i, j],
-            )
-
-    def _flopy_mg_get_xy(self, args, **kwargs):
-        i, j = self.parse_kij_args(args, kwargs)
-        if all([ij is None for ij in [i, j]]):
-            return i, j
-        else:
-            if self._spatial_ref_xarray is None:
-                self._spatial_ref_xarray = self._spatial_reference.xcellcenters
-                self._spatial_ref_yarray = self._spatial_reference.ycellcenters
-
-            return (self._spatial_ref_xarray[i, j], self._spatial_ref_yarray[i, j])
-
-    def parse_kij_args(self, args, kwargs):
-        """parse args into kij indices.  Called programmatically"""
-        if len(args) >= 2:
-            ij_id = None
-            if "ij_id" in kwargs:
-                ij_id = kwargs["ij_id"]
-            if ij_id is not None:
-                i, j = [args[ij] for ij in ij_id]
-            else:
-                if not self.ijwarned[self.add_pars_callcount]:
-                    self.logger.logged_warning(
-                        "get_xy() warning: position of i and j in index_cols "
-                        "not specified, assume (i,j) are final two entries in "
-                        "index_cols."
-                    )
-                    self.ijwarned[self.add_pars_callcount] = True
-                # assume i and j are the final two entries in index_cols
-                i, j = args[-2], args[-1]
-        else:
-            if not self.ijwarned[self.add_pars_callcount]:
-                self.logger.logged_warning(
-                    (
-                        "get_xy() warning: need locational information "
-                        "(e.g. i,j) to generate xy, "
-                        "insufficient index cols passed to interpret: {}"
-                        ""
-                    ).format(str(args))
-                )
-                self.ijwarned[self.add_pars_callcount] = True
-            i, j = None, None
-        return i, j
 
     def write_forward_run(self):
         """write the forward run script.  Called by build_pst()"""
@@ -569,8 +303,8 @@ class PstFrom(object):
             for _, l in gps.items():
                 df = pd.concat(l)
                 if "timedelta" in df.columns:
-                    df.loc[:, "y"] = 0  #
-                    df.loc[:, "x"] = df.timedelta.apply(lambda x: x.days)
+                    df.loc[:, "y"] = 0  # type: ignore
+                    df.loc[:, "x"] = df.timedelta.apply(lambda x: x.days)  # type: ignore
                 par_dfs.append(df)
             struct_dict[gs] = par_dfs
         return struct_dict
@@ -658,9 +392,7 @@ class PstFrom(object):
         # list for holding grid style groups
         gr_pe_l = []
         if use_specsim:
-            if not pyemu.geostats.SpecSim2d.grid_is_regular(
-                self.spatial_reference.delr, self.spatial_reference.delc
-            ):
+            if not self.spatial_reference.is_regular_grid():
                 raise self.logger.logged_exception(
                     "draw() error: can't use spectral simulation with irregular grid",
                     ValueError,
@@ -725,7 +457,7 @@ class PstFrom(object):
         draw_timer.finish()
         return pe
 
-    def build_pst(self, filename=None, update=False, version=1):
+    def build_pst(self, filename: Union[str, Path]=None, update: Union[bool, str, Sequence[str]]=False, version:Literal[1,2]=1):
         """Build control file from i/o files in PstFrom object.
         Warning: This builds a pest control file from scratch, overwriting
         anything already in self.pst object and anything already writen to `filename`
@@ -758,12 +490,12 @@ class PstFrom(object):
                     "Setting update to False"
                 )
                 update = False
-            else:
-                if filename is None:
-                    filename = get_filepath(self.new_d, self.pst.filename)
-        else:
-            if filename is None:
-                filename = Path(self.new_d, self.original_d.name).with_suffix(".pst")
+
+            elif filename is None:
+                filename = get_filepath(self.new_d, self.pst.filename)
+
+        if filename is None:
+            filename = Path(self.new_d, self.original_d.name).with_suffix(".pst")
         filename = get_filepath(self.new_d, filename)
 
         # if os.path.dirname(filename) in ["", "."]:
@@ -771,19 +503,20 @@ class PstFrom(object):
 
         if update:
             pst = self.pst
+            update_dict = {"pars": False, "obs": False}
             if update is True:
-                update = {"pars": False, "obs": False}
+                update_dict = {"pars": False, "obs": False}
             elif isinstance(update, str):
-                update = {update: True}
+                update_dict = {update: True}
             elif isinstance(update, (set, list)):
-                update = {s: True for s in update}
+                update_dict = {s: True for s in update}
             uupdate = True
         else:
-            update = {"pars": False, "obs": False}
+            update_dict = {"pars": False, "obs": False}
             uupdate = False
             pst = pyemu.Pst(filename, load=False)
 
-        if "pars" in update.keys() or not uupdate:
+        if "pars" in update_dict or not uupdate:
             if len(self.par_dfs) > 0:
                 # parameter data from object
                 par_data = pd.concat(self.par_dfs).loc[:, par_data_cols]
@@ -812,7 +545,7 @@ class PstFrom(object):
                 index=self.tpl_filenames,
             )
 
-        if "obs" in update.keys() or not uupdate:
+        if "obs" in update_dict or not uupdate:
             if len(self.obs_dfs) > 0:
                 obs_data = pd.concat(self.obs_dfs).loc[:, obs_data_cols]
             else:
@@ -1867,7 +1600,6 @@ class PstFrom(object):
         # TODO support passing par_file (i,j)/(x,y) directly where information
         #  is not contained in model parameter file - e.g. no i,j columns
         self.add_pars_callcount += 1
-        self.ijwarned[self.add_pars_callcount] = False
 
         logger = self.logger.getChild("add_parameters")
         if transform.lower().strip() not in ["none", "log", "fixed"]:
@@ -2122,7 +1854,7 @@ class PstFrom(object):
                 if (
                     par_type.startswith("grid") or par_type.startswith("p")
                 ) and geostruct is not None:
-                    get_xy = self.get_xy
+                    get_xy = self.spatial_reference.get_xy
                 df = write_list_tpl(
                     filenames,
                     dfs,
@@ -2176,7 +1908,7 @@ class PstFrom(object):
                             zone_array=zone_array,
                             shape=shp,
                             longnames=self.longnames,
-                            get_xy=self.get_xy,
+                            get_xy=self.spatial_reference.get_xy,
                             fill_value=1.0,
                             gpname=pargp,
                             input_filename=in_fileabs,
